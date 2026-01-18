@@ -1,4 +1,10 @@
 # paper-collector
 paper-collector
-논문수집기
 
+논문수집기
+(260118-01) add database audit columns (REG_DT/ID, MOD_DT/ID) and update data handling logic to track creation and modification history
+1) a_ino, c_info, user_info 에 REG_DT REG_ID MOD_DT MOD_ID 컬럼이 없으면 추가
+2) REG_DT REG_ID 컬럼이 비어 있으면 현재날짜, AD00000 으로 채우기
+3) 추가된 컬럼에 맞게 신규입력시  REG_DT REG_ID 컬럼을 입력한 시간과 입력한 ID로 채우기
+4) 추가된 컬럼에 맞게 수정시  MOD_DT MOD_ID 컬럼을 수정한 시간과 수정한 ID로 채우기
+맨 마지막에 커밋용 제목을 한 줄로 작성해줘.
