@@ -1,0 +1,64 @@
+﻿name,content
+sso-service,mdpi
+viewport,"width=device-width, initial-scale=1.0"
+theme-color,#ffffff
+application-name, 
+msapplication-TileImage,https://pub.mdpi-res.com/img/journals/molecules-logo-sq.png?8600e93ff98dbf14
+title,Sulforaphane Regulates eNOS Activation and NO Production via Src-Mediated PI3K/Akt Signaling in Human Endothelial EA.hy926 Cells
+description,"Sulforaphane (SFN) is a naturally occurring isothiocyanate that is abundant in many cruciferous vegetables, such as broccoli and cauliflower, and it has been observed to exert numerous biological activities. In the present study, we investigate the effect of SFN on eNOS, a key regulatory enzyme of vascular homeostasis and underlying intracellular pathways, in human endothelial EA.hy926 cells. The results indicate that SFN treatment significantly increases NO production and eNOS phosphorylation in a time- and dose-dependent fashion and also augments Akt phosphorylation in a time- and dose-dependent manner. Meanwhile, pretreatment with LY294002 (a specific PI3K inhibitor) suppresses the phosphorylation of eNOS and NO production. Furthermore, SFN time- and dose-dependently induces the phosphorylation of Src kinase, a further upstream regulator of PI3K, while PP2 pretreatment (a specific Src inhibitor) eliminates the increase in phosphorylated Akt, eNOS and the production of NO derived from eNOS. Overall, the present study uncovers a novel effect of SFN to stimulate eNOS activity in EA.hy926 cells by regulating NO bioavailability. These findings provide clear evidence that SFN regulates eNOS activity and NO bioavailability, suggesting a promising therapeutic candidate to prevent endothelial dysfunction, atherosclerosis and other cardiovascular diseases."
+dc.title,Sulforaphane Regulates eNOS Activation and NO Production via Src-Mediated PI3K/Akt Signaling in Human Endothelial EA.hy926 Cells
+dc.creator,Ying Zhang
+dc.creator,Pham Ngoc Khoi
+dc.creator,Bangrong Cai
+dc.creator,Dhiraj Kumar Sah
+dc.creator,Young-Do Jung
+dc.type,Article
+dc.source,"Molecules 2022, Vol. 27, Page 5422"
+dc.date,2022-08-24
+dc.identifier,10.3390/molecules27175422
+dc.publisher,Multidisciplinary Digital Publishing Institute
+dc.rights,http://creativecommons.org/licenses/by/3.0/
+dc.format,application/pdf
+dc.language,en
+dc.description,"Sulforaphane (SFN) is a naturally occurring isothiocyanate that is abundant in many cruciferous vegetables, such as broccoli and cauliflower, and it has been observed to exert numerous biological activities. In the present study, we investigate the effect of SFN on eNOS, a key regulatory enzyme of vascular homeostasis and underlying intracellular pathways, in human endothelial EA.hy926 cells. The results indicate that SFN treatment significantly increases NO production and eNOS phosphorylation in a time- and dose-dependent fashion and also augments Akt phosphorylation in a time- and dose-dependent manner. Meanwhile, pretreatment with LY294002 (a specific PI3K inhibitor) suppresses the phosphorylation of eNOS and NO production. Furthermore, SFN time- and dose-dependently induces the phosphorylation of Src kinase, a further upstream regulator of PI3K, while PP2 pretreatment (a specific Src inhibitor) eliminates the increase in phosphorylated Akt, eNOS and the production of NO derived from eNOS. Overall, the present study uncovers a novel effect of SFN to stimulate eNOS activity in EA.hy926 cells by regulating NO bioavailability. These findings provide clear evidence that SFN regulates eNOS activity and NO bioavailability, suggesting a promising therapeutic candidate to prevent endothelial dysfunction, atherosclerosis and other cardiovascular diseases."
+dc.subject,sulforaphane
+dc.subject,Src
+dc.subject,Akt
+dc.subject,eNOS
+dc.subject,NO
+dc.subject,EA.hy926
+prism.issn,1420-3049
+prism.publicationName,Molecules
+prism.publicationDate,2022-08-24
+prism.section,Article
+prism.volume,27
+prism.number,17
+prism.startingPage,5422
+citation_issn,1420-3049
+citation_journal_title,Molecules
+citation_publisher,Multidisciplinary Digital Publishing Institute
+citation_title,Sulforaphane Regulates eNOS Activation and NO Production via Src-Mediated PI3K/Akt Signaling in Human Endothelial EA.hy926 Cells
+citation_publication_date,2022/1
+citation_online_date,2022/08/24
+citation_volume,27
+citation_issue,17
+citation_firstpage,5422
+citation_author,"Zhang, Ying"
+citation_author,"Khoi, Pham Ngoc"
+citation_author,"Cai, Bangrong"
+citation_author,"Sah, Dhiraj Kumar"
+citation_author,"Jung, Young-Do"
+citation_doi,10.3390/molecules27175422
+citation_id,mdpi-molecules27175422
+citation_abstract_html_url,https://www.mdpi.com/1420-3049/27/17/5422
+citation_pdf_url,https://www.mdpi.com/1420-3049/27/17/5422/pdf?version=1661476227
+fulltext_pdf,https://www.mdpi.com/1420-3049/27/17/5422/pdf?version=1661476227
+citation_fulltext_html_url,https://www.mdpi.com/1420-3049/27/17/5422/htm
+fulltext_html,https://www.mdpi.com/1420-3049/27/17/5422/htm
+fulltext_xml,https://www.mdpi.com/1420-3049/27/17/5422/xml
+citation_xml_url,https://www.mdpi.com/1420-3049/27/17/5422/xml
+twitter:card,summary
+twitter:site,@MDPIOpenAccess
+twitter:image,https://pub.mdpi-res.com/img/journals/molecules-logo-social.png?8600e93ff98dbf14
+google-site-verification,PxTlsg7z2S00aHroktQd57fxygEjMiNHydKn3txhvwY
+facebook-domain-verification,mcoq8dtq6sb2hf7z29j8w515jjoof7
