@@ -12,6 +12,7 @@ __pycache__/
 *.db
 *.pdf
 *.json
+*.csv
 *txt
 *.yaml
 uploaded/
