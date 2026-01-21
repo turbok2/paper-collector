@@ -1656,7 +1656,7 @@ def show_dashboard(df, is_admin=False):
     st.markdown("### 📌 핵심 요약")
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     
-    total_papers = len(df)
+    total_papers = len(df) 
     
     current_year = datetime.datetime.now().year
     this_year_papers = len(df[df['PUBLICATION_YEAR'].astype(str) == str(current_year)])
@@ -1725,28 +1725,39 @@ def show_dashboard(df, is_admin=False):
                 st.plotly_chart(fig_year, use_container_width=True)
 
             with col_y2:
-                # [Chart 2] 최근 5년 집중 분석 (Donut Chart)
-                st.markdown("#### 🔥 최근 5년 비중")
+                # [Chart 2] 최근 7년 집중 분석 (Donut Chart)
+                st.markdown("#### 🔥 최근 7년 비중")
                 
-                # [수정된 부분] None 값을 제외하고 정렬 (에러 해결)
-                # dropna()로 None/NaN을 제거한 후 unique()를 추출
+                # None 값을 제외하고 정렬 (에러 해결)
                 valid_years = df['PUBLICATION_YEAR'].dropna().unique()
-                recent_years = sorted(valid_years, reverse=True)[:5]
+                recent_years = sorted(valid_years, reverse=True)[:7]
                 
                 recent_df = df[df['PUBLICATION_YEAR'].isin(recent_years)]
                 
                 if not recent_df.empty:
+                    # [수정 시작] -------------------------------------------------------
+                    # 1. 연도별 개수를 집계하고 연도순(오름차순)으로 정렬합니다.
+                    #    (value_counts()로 세고, sort_index()로 연도 정렬)
+                    pie_data = recent_df['PUBLICATION_YEAR'].value_counts().sort_index().reset_index()
+                    pie_data.columns = ['PUBLICATION_YEAR', 'Count']
+
+                    # 2. 집계된 데이터(pie_data)를 사용하여 차트를 그립니다.
                     fig_recent = px.pie(
-                        recent_df, 
+                        pie_data, 
                         names='PUBLICATION_YEAR', 
+                        values='Count', # 집계된 개수 값을 지정
                         hole=0.4,
                         color_discrete_sequence=px.colors.sequential.RdBu
                     )
-                    fig_recent.update_traces(textposition='inside', textinfo='percent+label')
+                    
+                    # 3. sort=False를 설정하여 값의 크기가 아닌 '데이터의 순서(연도순)'대로 표시합니다.
+                    fig_recent.update_traces(textposition='inside', textinfo='percent+label', sort=False)
+                    # [수정 끝] ---------------------------------------------------------
+                    
                     fig_recent.update_layout(showlegend=False, margin=dict(t=20, b=20, l=20, r=20), height=350)
                     st.plotly_chart(fig_recent, use_container_width=True)
                 else:
-                    st.info("최근 5년 데이터가 없습니다.")
+                    st.info("최근 7년 데이터가 없습니다.")
 
     with tab2:
         col_j1, col_j2 = st.columns([0.5, 0.5])
@@ -1780,17 +1791,28 @@ def show_dashboard(df, is_admin=False):
         # [Chart 4] 논문 제목 워드클라우드 (Treemap)
         if 'TITLE' in df.columns:
             with col_j2:
-                st.markdown("#### 🧠 주요 연구 키워드 (Top 15)")
+                st.markdown("#### 🧠 주요 연구 키워드 (Top 20)")
                 
                 all_titles = " ".join(df['TITLE'].dropna().astype(str).tolist()).lower()
                 all_titles = re.sub(r'[^\w\s]', '', all_titles)
                 words = all_titles.split()
                 
-                stopwords = set(['the', 'of', 'and', 'in', 'to', 'a', 'with', 'for', 'on', 'by', 'an', 'at', 'study', 'analysis', 'using', 'between', 'during', 'associated', 'clinical', 'patients'])
-                filtered_words = [w for w in words if w not in stopwords and len(w) > 2]
+                stopwords = set(['the', 'of', 'and', 'in', 'to', 'a', 'with', 'for', 'on', 'by', 'an', 'at', 'study', 'analysis', 'using', 'between', 'during', 'associated', 'clinical', 'patients','after','from','report','outcomes','case','acute','treatment','association','multicenter','disease','risk','effect','factors','model','comparison','trial','effects','impact','early','review','characteristics'])
+                # [추가] 유사 단어 병합 매핑 (입력 단어 -> 표시될 단어)
+                merge_keywords = {
+                    'cell': 'cell/cells', 'cells': 'cell/cells',
+                    'korea': 'korea/korean', 'korean': 'korea/korean'
+                }                
+                filtered_words = []
+                for w in words:
+                    if w not in stopwords and len(w) > 2:
+                        # 매핑 테이블에 있으면 변환된 값 사용, 없으면 원래 단어 사용
+                        final_word = merge_keywords.get(w, w)
+                        filtered_words.append(final_word)
                 
-                word_counts = Counter(filtered_words).most_common(15)
+                word_counts = Counter(filtered_words).most_common(20)
                 word_df = pd.DataFrame(word_counts, columns=['Keyword', 'Frequency'])
+                # print(word_df)
                 
                 if not word_df.empty:
                     fig_word = px.treemap(
@@ -2761,6 +2783,7 @@ def show_my_info_page():
                                     # 화면 표시용 DF도 갱신해야 NaN으로 안보임
                                     if "author_search_display" in st.session_state and '직원번호' in st.session_state.author_search_display.columns:
                                         st.session_state.author_search_display.at[idx, '직원번호'] = user_id
+                                        st.session_state.author_search_display.at[idx, '이름'] = user_name
 
                                 # 1. 검색 결과 없음 -> 내 계정으로
                                 if not matches:
