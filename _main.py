@@ -1441,6 +1441,12 @@ def show_main_app_page():
                     
                     a_info = a_info[['AUTHOR', 'AFFILIATION', 'ROLE', 'ORI_FILE_NAME','PDF_FILE_NAME', 'JSON_FILE_NAME','LLM_JSON_FILE_NAME']]
                     
+                    # [수정] ROLE 기준 정렬 (FIRST -> CORRESPONDING -> CO_AUTHOR)
+                    if 'ROLE' in a_info.columns:
+                        role_order = {"FIRST_AUTHOR": 1, "CORRESPONDING_AUTHOR": 2, "CO_AUTHOR": 3}
+                        a_info['ROLE_SORT'] = a_info['ROLE'].map(role_order).fillna(99)
+                        a_info = a_info.sort_values(by=['ROLE_SORT']).drop(columns=['ROLE_SORT'])
+
                     st.session_state.json_data = json_data
                     st.session_state.a_paper_info = a_info
                     st.session_state.c_paper_info = c_info
@@ -2204,6 +2210,12 @@ def show_my_papers_page():
                 doi_value = row.get("DOI")
                 title = row.get("TITLE")
 
+                # [수정] 다른 논문을 선택했을 때 편집 모드가 유지되는 문제 해결
+                # 편집 중인 대상(admin_edit_target_pdf)과 현재 선택된 파일(pdf_fname)이 다르면 편집 모드 해제
+                if st.session_state.admin_paper_editing and st.session_state.admin_edit_target_pdf != pdf_fname:
+                    st.session_state.admin_paper_editing = False
+                    st.session_state.admin_edit_target_pdf = None
+
                 # --- 1) 기본 보기 모드 (편집 중이 아닐 때) ---
                 if not st.session_state.admin_paper_editing:
                     st.markdown("---")
@@ -2304,11 +2316,12 @@ def show_my_papers_page():
                         
                         a_query = "SELECT * FROM a_info WHERE PDF_FILE_NAME = ?"
                         a_df_edit = pd.read_sql_query(a_query, conn, params=(pdf_fname,))
+
                         # [수정] ROLE 기준 정렬 (FIRST -> CORRESPONDING -> CO_AUTHOR)
                         if not a_df_edit.empty and 'ROLE' in a_df_edit.columns:
                             role_order = {"FIRST_AUTHOR": 1, "CORRESPONDING_AUTHOR": 2, "CO_AUTHOR": 3}
                             a_df_edit['ROLE_SORT'] = a_df_edit['ROLE'].map(role_order).fillna(99)
-                            a_df_edit = a_df_edit.sort_values(by=['ROLE_SORT']).drop(columns=['ROLE_SORT'])                        
+                            a_df_edit = a_df_edit.sort_values(by=['ROLE_SORT']).drop(columns=['ROLE_SORT'])
                     except Exception as e:
                         st.error(f"데이터 로드 실패: {e}")
                         c_df_edit = pd.DataFrame()
@@ -2334,7 +2347,7 @@ def show_my_papers_page():
                         c_df_display = c_df_transposed.iloc[5:-4]
                     else:
                         c_df_display = c_df_transposed.iloc[5:] if len(c_df_transposed) > 5 else c_df_transposed
-                    
+
                     # [수정] 데이터 에디터 설정
                     # Key 컬럼은 수정 불가능하게(disabled), Value 컬럼만 수정 가능하게 설정
                     edited_c_transposed = st.data_editor(
@@ -2349,6 +2362,7 @@ def show_my_papers_page():
                     )
                     
                     st.markdown("**2. 저자정보 (a_info)**")
+                    
                     # [수정] 앞의 5개, 뒤의 4개 컬럼 숨기기
                     a_cols_head = a_df_edit.columns[:5]
                     a_cols_tail = a_df_edit.columns[-4:]
@@ -2368,7 +2382,6 @@ def show_my_papers_page():
                             try:
                                 # [수정] 전치된 c_info를 다시 원래의 가로 형태(DB 구조)로 복원
                                 # "Key" 컬럼을 인덱스로 설정하고 전치(.T)
-                                # c_df_restored = edited_c_transposed.set_index("Key").T
                                 c_df_restored_partial = edited_c_transposed.set_index("Key").T
                                 
                                 # [수정] 숨겨진 컬럼 복원 (c_info)
@@ -2380,12 +2393,9 @@ def show_my_papers_page():
                                 for col in a_cols_head:
                                     if col in c_df_edit.columns:
                                         edited_a[col] = c_df_edit[col].iloc[0]
-
-                                # 복원된 데이터프레임의 인덱스를 리셋하거나 그대로 사용 (update 함수 로직에 맞춤)
-                                # update_or_add_paper_data는 컬럼명 매칭으로 동작하므로 인덱스 이름은 상관없음
                                 
                                 # [수정] 사용자 ID 전달 (이력 관리)
-                                c_saved = update_or_add_paper_data(c_df_final, "c_info", key_cols, user_id=st.session_state.username)                               
+                                c_saved = update_or_add_paper_data(c_df_final, "c_info", key_cols, user_id=st.session_state.username)
                                 a_saved = update_or_add_paper_data(edited_a, "a_info", key_cols, user_id=st.session_state.username)
                                 
                                 if c_saved and a_saved:
@@ -4656,6 +4666,12 @@ def show_receipt_processing_page():
 
                             a_info = a_info[['AUTHOR', 'AFFILIATION', 'ROLE', '이름', 'ORI_FILE_NAME','PDF_FILE_NAME', 'JSON_FILE_NAME','LLM_JSON_FILE_NAME']]
                             
+                            # [수정] ROLE 기준 정렬 (FIRST -> CORRESPONDING -> CO_AUTHOR)
+                            if 'ROLE' in a_info.columns:
+                                role_order = {"FIRST_AUTHOR": 1, "CORRESPONDING_AUTHOR": 2, "CO_AUTHOR": 3}
+                                a_info['ROLE_SORT'] = a_info['ROLE'].map(role_order).fillna(99)
+                                a_info = a_info.sort_values(by=['ROLE_SORT']).drop(columns=['ROLE_SORT'])
+
                             st.session_state.receipt_c_info = c_info
                             st.session_state.receipt_a_info = a_info
                             st.session_state.receipt_c_info_original = c_info.copy()
