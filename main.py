@@ -7,7 +7,7 @@ import sqlite3
 import bcrypt
 import json
 import pandas as pd
-from get_paper_info import get_paper_df, get_pdf_json
+from get_paper_info import get_paper_df, get_pdf_json, extract_missing_abstract # <--- extract_missing_abstract 추가
 from name_change import korean_name_to_english
 import base64
 import shutil
@@ -2665,6 +2665,92 @@ def show_my_papers_page():
     with tab_dash:
         show_dashboard(df_view, is_admin=is_admin)
 
+# --- [추가] 빈 초록 일괄 업데이트 로직 ---
+def update_abstracts_batch():
+    """
+    c_info 테이블에서 ABSTRACT가 비어있는 항목을 찾아 
+    LLM으로 초록을 재추출하고 DB와 resolved 폴더의 JSON 파일에 업데이트합니다.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # 1. ABSTRACT 컬럼이 없을 경우를 대비해 컬럼 추가 (안전 장치)
+    cursor.execute("PRAGMA table_info(c_info)")
+    cols = [info[1] for info in cursor.fetchall()]
+    if "ABSTRACT" not in cols:
+        cursor.execute("ALTER TABLE c_info ADD COLUMN ABSTRACT TEXT")
+        conn.commit()
+
+    # 2. 초록이 비어있거나 'NO_TEXT'인 데이터 조회 (JSON_FILE_NAME이 존재하는 것만)
+    cursor.execute("""
+        SELECT PDF_FILE_NAME, JSON_FILE_NAME, LLM_JSON_FILE_NAME
+        FROM c_info
+        WHERE (ABSTRACT IS NULL OR ABSTRACT = '' OR ABSTRACT = 'NO_TEXT')
+          AND JSON_FILE_NAME IS NOT NULL AND JSON_FILE_NAME != ''
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        conn.close()
+        return 0, 0
+
+    total = len(rows)
+    success_count = 0
+
+    # 진행률 표시 UI 
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, (pdf_file, json_file, llm_json_file) in enumerate(rows):
+        status_text.text(f"🔄 처리 중 [{i+1}/{total}] : {pdf_file}")
+
+        uploaded_json_path = os.path.join(upload_folder, json_file)
+
+        if os.path.exists(uploaded_json_path):
+            # LLM을 통해 초록만 새로 추출
+            extracted_abstract = extract_missing_abstract(uploaded_json_path)
+
+            if extracted_abstract and extracted_abstract not in ["NO_TEXT", "ERROR"]:
+                # [A] DB 업데이트
+                cursor.execute(
+                    "UPDATE c_info SET ABSTRACT = ? WHERE PDF_FILE_NAME = ?",
+                    (extracted_abstract, pdf_file)
+                )
+
+                # [B] resolved 폴더의 JSON 파일 업데이트 (TITLE 바로 다음에 삽입)
+                if llm_json_file:
+                    resolved_json_path = os.path.join(resolve_folder, llm_json_file)
+                    if os.path.exists(resolved_json_path):
+                        with open(resolved_json_path, 'r', encoding='utf-8') as f:
+                            llm_data = json.load(f)
+
+                        # TITLE 뒤에 ABSTRACT를 넣기 위해 딕셔너리 재조립
+                        new_llm_data = {}
+                        inserted = False
+                        for k, v in llm_data.items():
+                            new_llm_data[k] = v
+                            if k == "TITLE":
+                                new_llm_data["ABSTRACT"] = extracted_abstract
+                                inserted = True
+                        
+                        # 예외 처리: TITLE 필드가 없었을 경우 맨 마지막에 추가
+                        if not inserted:
+                            new_llm_data["ABSTRACT"] = extracted_abstract
+
+                        with open(resolved_json_path, 'w', encoding='utf-8') as f:
+                            json.dump(new_llm_data, f, indent=2, ensure_ascii=False)
+
+                success_count += 1
+
+        # 진도율 게이지 업데이트
+        progress_bar.progress((i + 1) / total)
+
+    conn.commit()
+    conn.close()
+
+    status_text.text(f"✅ 처리 완료! (성공: {success_count}/{total}건)")
+    return total, success_count
+
 def show_settings_page():
     """설정 페이지를 표시합니다."""
     import textwrap  # 들여쓰기 제거를 위해 필요
@@ -2793,6 +2879,19 @@ cursor: default;">
                 with st.spinner("파일을 정리하는 중입니다..."):
                     deleted = cleanup_resolved_files()
                 st.success(f"✅ 정리 완료: 총 {deleted}개의 이전 중복 파일이 삭제되었습니다.")
+            # ---------- [여기서부터 아래 코드 추가] ----------
+            st.markdown("---")
+            st.markdown("#### 누락된 초록(ABSTRACT) 일괄 업데이트")
+            st.info("💡 DB에서 초록이 비어있거나 'NO_TEXT'인 논문을 찾아 LLM으로 다시 분석하고, DB 및 결과 파일에 업데이트합니다.")
+
+            if st.button("🚀 초록 일괄 업데이트 실행", type="primary"):
+                total_cnt, success_cnt = update_abstracts_batch()
+
+                if total_cnt == 0:
+                    st.info("업데이트가 필요한 빈 초록 데이터가 없습니다.")
+                else:
+                    st.success(f"🎉 총 {total_cnt}건 중 {success_cnt}건의 초록 업데이트가 완료되었습니다.")
+            # ---------- [여기까지 추가] ----------                
 
 def show_my_info_page():
     """내정보 수정 페이지를 표시합니다."""
@@ -3909,5 +4008,5 @@ def main():
         show_login_page()
 
 if __name__ == "__main__":
-    version = "1.0.4"
+    version = "1.0.5"
     main()

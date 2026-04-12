@@ -312,6 +312,44 @@ def count_no_text(json_data):
     no_cnt = sum(1 for v in json_data.values() if v == "NO_TEXT")
     return cnt_total, no_cnt
 
+# --- [추가] 특정 필드(ABSTRACT)만 추출하는 함수 ---
+def extract_missing_abstract(json_file_path):
+    """
+    uploaded 폴더의 JSON 파일을 읽어 YAML 프롬프트 중 'ABSTRACT' 항목만 LLM에 요청하여 반환합니다.
+    """
+    prompts = load_prompts(PROMPT_PATH)
+    if "ABSTRACT" not in prompts:
+        return "ERROR: ABSTRACT prompt not found"
+
+    instruction = prompts["ABSTRACT"].get("description", "")
+
+    try:
+        with open(json_file_path, "r", encoding="utf-8") as f:
+            json_data = json.load(f)
+
+        combined_text, _ = extract_text_from_json_blocks(
+            json_data,
+            allowed_types=ALLOWED_TYPES,
+            target_pages=TARGET_PAGES,
+            max_page_number=MAX_PAGE_NUMBER,
+        )
+
+        if combined_text.strip() == "":
+            return "NO_TEXT"
+
+        # 모델 선택
+        if "gpt" in MODEL_NAME:
+            llm = GPTApi(model_name=MODEL_NAME, api_key=OPENAI_API_KEY)
+        else:
+            llm = LocalApi(model_name=MODEL_NAME, base_url=LLAMA_URL)
+
+        # LLM 호출
+        res = llm.send_request("ABSTRACT", instruction, combined_text)
+        return res["parsed"]
+
+    except Exception as e:
+        print(f"[ABSTRACT Extraction Error] {e}")
+        return "ERROR"
 
 def get_paper_df(filename):
     prompts = load_prompts(PROMPT_PATH)
