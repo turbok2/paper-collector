@@ -197,6 +197,7 @@ def parsing_json(json_data):
     # [STEP 1] C_DATA 구성
     DESIRED_KEYS = [
         "TITLE",
+        "ABSTRACT",
         "AUTHOR_LIST",
         "AFFILIATION_LIST",
         "FIRST_AUTHOR",
