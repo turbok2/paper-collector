@@ -35,3 +35,7 @@ user_info의 hname1, hname2, hname3, hname4 에 차례로 기록하는 코드 �
 (260411-01) 1.0.3  PDF 교체, 삭제
 1) 사용자가 pdf 업로드시 pdf가 달라도 TITLE 이 같은 경우 : PDF파일 변경 신청 기능 추가
 2) 함수화 : PDF 뷰어, PDF파일 변경, uploaded, resolved 폴더 내 관련 파일을 삭제
+
+(260412-01) 1.0.4  uploaded 폴더에 동일 hash 포함한 파일 있으면 지우는 기능
+1) uploaded 폴더에 동일 hash 포함한 파일 있으면 지우는 기능:관리자
+2) uploaded 폴더에 저장시 동일 hash 포함한 파일 있으면 지우는 기능 추가

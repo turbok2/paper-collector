@@ -1140,6 +1140,12 @@ def save_output_file(result, filename, model_name, OUTPUT_FOLDER):
         output_path = os.path.join(OUTPUT_FOLDER, output_filename)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
+            
+        # [추가] resolved 폴더에 저장할 경우, 동일한 해시의 구버전 파일 자동 삭제
+        if OUTPUT_FOLDER == resolve_folder:
+            base_hash = filename.replace(".json", "").replace(" ", "_")[:200]
+            cleanup_resolved_files(target_hash=base_hash)
+            
         return output_path, None
 
     except Exception as e:
@@ -1181,6 +1187,54 @@ def delete_paper_files(pdf_filename):
                     os.remove(os.path.join(resolve_folder, filename))
                 except Exception as e:
                     print(f"Failed to delete from resolved: {filename}, Error: {e}")
+
+# -------------------------------------------------------------------------
+# [추가] 4. resolved 폴더 내 이전 분석 파일(중복 해시) 정리 함수
+# -------------------------------------------------------------------------
+def cleanup_resolved_files(target_hash=None):
+    """
+    resolved 폴더 내의 파일들을 확인하여, 동일한 해시를 가진 파일이 여러 개일 경우
+    가장 최신(이름의 타임스탬프 기준) 파일만 남기고 삭제합니다.
+    target_hash가 주어지면 해당 해시에 대해서만 처리하고, 없으면 전체 폴더를 정리합니다.
+    """
+    if not os.path.exists(resolve_folder):
+        return 0
+        
+    deleted_count = 0
+    hash_groups = {}
+    
+    # 파일명 예시: 20260412_015154_gpt-4o..._b519d6b7..._output.json
+    # 타임스탬프: (\d{8}_\d{6}), 중간 모델명, 해시: ([a-fA-F0-9]+), 확장자: _output.json
+    pattern = re.compile(r'^(\d{8}_\d{6})_.*_([a-fA-F0-9]+)_output\.json$')
+    
+    for filename in os.listdir(resolve_folder):
+        match = pattern.match(filename)
+        if match:
+            timestamp = match.group(1)
+            file_hash = match.group(2)
+            
+            # 특정 해시만 타겟팅한 경우 필터링
+            if target_hash and file_hash != target_hash:
+                continue
+                
+            if file_hash not in hash_groups:
+                hash_groups[file_hash] = []
+            hash_groups[file_hash].append((timestamp, filename))
+            
+    for file_hash, files in hash_groups.items():
+        if len(files) > 1:
+            # 타임스탬프 기준 내림차순 정렬 (최신 시간이 0번 인덱스로 옴)
+            files.sort(key=lambda x: x[0], reverse=True)
+            
+            # 첫 번째(최신) 파일을 제외한 나머지 삭제
+            for _, fname in files[1:]:
+                try:
+                    os.remove(os.path.join(resolve_folder, fname))
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"Failed to delete old resolved file: {fname}, Error: {e}")
+                    
+    return deleted_count
 
 # -------------------------------------------------------------------------
 # [추가] 2. 논문 제목 정규화 함수
@@ -2620,10 +2674,12 @@ def show_settings_page():
     tabs_list = ["🔐 계정 및 보안"]
     if st.session_state.username == "AD00000":
         tabs_list.append("🎨 화면 설정 (관리자)")
+        # [추가] 데이터 관리 탭 추가
+        tabs_list.append("🗄️ 데이터 관리 (관리자)")
     
     tabs = st.tabs(tabs_list)
 
-    # [탭 1] 계정 및 보안 (기존 유지)
+    # [탭 1] 계정 및 보안
     with tabs[0]:
         st.write(f"현재 로그인 사용자: **{st.session_state.username}**")
         st.markdown("#### 비밀번호 변경")
@@ -2669,14 +2725,11 @@ def show_settings_page():
                 key="theme_selector"
             )
             
-            # 선택된 테마 정보 가져오기
             preview = THEMES[selected_theme]
 
             st.markdown("---")
             st.markdown(f"##### 👀 '{selected_theme}' 테마 미리보기")
             
-            # [수정 1] 미리보기 HTML을 실제 CSS(apply_custom_styles)와 100% 동일하게 맞춤
-            # Secondary 버튼: 테마 Primary 색상 배경 + 흰색 글씨 + 투명 테두리
             preview_html = textwrap.dedent(f"""
 <div style="background-color: {preview['bg_color']}; padding: 20px; border-radius: 10px; border: 1px solid #ddd; font-family: sans-serif;">
 <h4 style="color: {preview['header_color']}; margin-top: 0; margin-bottom: 10px;">헤더 텍스트 예시</h4>
@@ -2690,7 +2743,7 @@ def show_settings_page():
 width: 100%;
 background: linear-gradient(135deg, {preview['gradient_start']} 0%, {preview['gradient_end']} 100%);
 color: #ffffff;
-border: 3px solid #ff4b4b; /* 빨간 테두리 */
+border: 3px solid #ff4b4b;
 padding: 10px 20px;
 border-radius: 8px;
 font-weight: 700;
@@ -2720,10 +2773,8 @@ cursor: default;">
             """)
             st.markdown(preview_html, unsafe_allow_html=True)
             
-            st.write("") # 간격
+            st.write("")
 
-            # [수정 2] '적용하기' 버튼은 빨간 테두리가 없어야 하므로 type="secondary" 사용
-            # (primary 타입은 CSS에서 빨간 테두리가 강제 적용되므로 피해야 함)
             if st.button("이 테마로 전체 적용하기", type="secondary"):
                 if set_system_theme(selected_theme):
                     st.session_state.current_theme = selected_theme
@@ -2731,6 +2782,17 @@ cursor: default;">
                     st.rerun()
                 else:
                     st.error("테마 저장 중 오류가 발생했습니다.")
+
+    # [탭 3] 데이터 관리 (관리자 전용)
+    if st.session_state.username == "AD00000" and len(tabs) > 2:
+        with tabs[2]:
+            st.markdown("#### Resolved 폴더 정리")
+            st.info("💡 분석 결과(JSON) 폴더에서 동일한 해시를 가진 파일들을 찾아, 타임스탬프 기준 가장 최신 파일만 남기고 이전 중복 파일들을 모두 삭제합니다.")
+            
+            if st.button("🗑️ Resolved 파일 정리 실행", type="primary"):
+                with st.spinner("파일을 정리하는 중입니다..."):
+                    deleted = cleanup_resolved_files()
+                st.success(f"✅ 정리 완료: 총 {deleted}개의 이전 중복 파일이 삭제되었습니다.")
 
 def show_my_info_page():
     """내정보 수정 페이지를 표시합니다."""
@@ -3847,5 +3909,5 @@ def main():
         show_login_page()
 
 if __name__ == "__main__":
-    version = "1.0.3"
+    version = "1.0.4"
     main()
