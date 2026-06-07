@@ -392,8 +392,68 @@ def init_db():
         except Exception as e:
             print(f"Error updating default values for {tbl}: {e}")
 
+    # [추가] a_info 확정 상태 컬럼 추가 (CONFIRM_STATUS, CONFIRM_DT, CONFIRM_ID)
+    c.execute("PRAGMA table_info(a_info)")
+    a_info_cols = [col[1] for col in c.fetchall()]
+    if "CONFIRM_STATUS" not in a_info_cols:
+        c.execute("ALTER TABLE a_info ADD COLUMN CONFIRM_STATUS TEXT DEFAULT 'UNCONFIRMED'")
+        c.execute("UPDATE a_info SET CONFIRM_STATUS = 'UNCONFIRMED' WHERE CONFIRM_STATUS IS NULL OR CONFIRM_STATUS = ''")
+    if "CONFIRM_DT" not in a_info_cols:
+        c.execute("ALTER TABLE a_info ADD COLUMN CONFIRM_DT TEXT")
+    if "CONFIRM_ID" not in a_info_cols:
+        c.execute("ALTER TABLE a_info ADD COLUMN CONFIRM_ID TEXT")
+    # 기존 직원번호가 있는 행은 USER_CLAIMED으로 마이그레이션 (최초 1회)
+    c.execute("""
+        UPDATE a_info SET CONFIRM_STATUS = 'USER_CLAIMED'
+        WHERE 직원번호 IS NOT NULL AND 직원번호 != ''
+          AND (CONFIRM_STATUS IS NULL OR CONFIRM_STATUS = '' OR CONFIRM_STATUS = 'UNCONFIRMED')
+    """)
+
+    # [추가] 활동 로그 테이블 생성
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS "activity_log" (
+            "id"            INTEGER PRIMARY KEY AUTOINCREMENT,
+            "ACTION_DT"     TEXT NOT NULL,
+            "ACTION_TYPE"   TEXT NOT NULL,
+            "ACTOR_ID"      TEXT NOT NULL,
+            "ACTOR_NAME"    TEXT,
+            "TARGET_TABLE"  TEXT,
+            "TARGET_KEY"    TEXT,
+            "OLD_VALUE"     TEXT,
+            "NEW_VALUE"     TEXT,
+            "MEMO"          TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+# -------------------------------------------------------------------------
+# [추가] 활동 로그 기록 함수
+# -------------------------------------------------------------------------
+def add_activity_log(action_type, actor_id, actor_name="",
+                     target_table="", target_key="",
+                     old_value=None, new_value=None, memo="") -> bool:
+    """모든 데이터 변경 이벤트를 activity_log 테이블에 기록합니다.
+    로그 실패가 사용자 작업을 중단시키지 않도록 try/except로 완전히 보호합니다."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        action_dt = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        old_str = json.dumps(old_value, ensure_ascii=False) if old_value is not None else None
+        new_str = json.dumps(new_value, ensure_ascii=False) if new_value is not None else None
+        c.execute(
+            """INSERT INTO activity_log
+               (ACTION_DT, ACTION_TYPE, ACTOR_ID, ACTOR_NAME, TARGET_TABLE, TARGET_KEY, OLD_VALUE, NEW_VALUE, MEMO)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (action_dt, action_type, actor_id, actor_name, target_table, target_key, old_str, new_str, memo)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[activity_log] 기록 실패: {e}")
+        return False
 
 # -------------------------------------------------------------------------
 # [추가] hr_info 테이블에서 직원 검색 함수 (요구사항 3)
@@ -637,7 +697,8 @@ def search_author_by_name(name_variations, korean_name=None):
             return pd.DataFrame()
                 
         full_query = f"""
-            SELECT a.AUTHOR, a.ROLE, a.AFFILIATION, a.이름,a.직원번호, c.*
+            SELECT a.AUTHOR, a.ROLE, a.AFFILIATION, a.이름, a.직원번호,
+                   a.CONFIRM_STATUS, a.CONFIRM_DT, a.CONFIRM_ID, c.*
             FROM a_info a
             LEFT JOIN c_info c ON a.PDF_FILE_NAME = c.PDF_FILE_NAME
             WHERE {' OR '.join(query_parts)}
@@ -645,11 +706,13 @@ def search_author_by_name(name_variations, korean_name=None):
         """
 
         df = pd.read_sql_query(full_query, conn, params=params)
-        
+
         # [수정 3] 중복 컬럼 처리
         # 조인 시 PDF_FILE_NAME 등의 컬럼이 중복될 수 있으므로 중복된 컬럼 제거
         df = df.loc[:, ~df.columns.duplicated()]
-        df = df[['AUTHOR', '이름','직원번호','ROLE',  'AFFILIATION','TITLE','PUBLICATION_YEAR','JOURNAL_NAME','FIRST_AUTHOR','CORRESPONDING_AUTHOR','AUTHOR_LIST','VOLUME','ISSUE','PAGE','DOI','PDF_FILE_NAME']]
+        df = df[['AUTHOR', '이름', '직원번호', 'ROLE', 'AFFILIATION', 'CONFIRM_STATUS',
+                 'TITLE', 'PUBLICATION_YEAR', 'JOURNAL_NAME', 'FIRST_AUTHOR',
+                 'CORRESPONDING_AUTHOR', 'AUTHOR_LIST', 'VOLUME', 'ISSUE', 'PAGE', 'DOI', 'PDF_FILE_NAME']]
         conn.close()
         return df.drop_duplicates() if not df.empty else pd.DataFrame()
         
@@ -658,6 +721,29 @@ def search_author_by_name(name_variations, korean_name=None):
         if conn:
             conn.close()
         return pd.DataFrame()
+
+def search_users_by_name_by_eng(eng_name):
+    """영문 이름(hname1~4)으로 user_info를 검색합니다. 관리자 업로드 시 직원번호 조회에 사용."""
+    if not eng_name:
+        return []
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    try:
+        eng_lower = eng_name.strip().lower()
+        c.execute(
+            """SELECT name, id, dep, duty, hname1, hname2, hname3, hname4
+               FROM user_info
+               WHERE LOWER(hname1)=? OR LOWER(hname2)=? OR LOWER(hname3)=? OR LOWER(hname4)=?""",
+            (eng_lower, eng_lower, eng_lower, eng_lower)
+        )
+        return [dict(r) for r in c.fetchall()]
+    except Exception as e:
+        print(f"eng name search error: {e}")
+        return []
+    finally:
+        conn.close()
+
 
 # [추가] 이름으로 사용자(HR) 정보 검색하는 함수
 def search_users_by_name(kname_query, name_query=None):
@@ -690,40 +776,223 @@ def search_users_by_name(kname_query, name_query=None):
     finally:
         conn.close()
 
-# [수정] claim_my_paper 함수 개선 (직원번호 업데이트 포함)
+# [수정] claim_my_paper 함수 개선 (확정 상태 및 활동 로그 포함)
 def claim_my_paper(pdf_filename, author, affiliation, user_id, user_name):
     """
     선택된 논문 저자 정보(a_info)에 사용자의 직원번호(ID)와 이름(Name)을 업데이트합니다.
+    ADMIN_CONFIRMED 행은 수정 불가합니다.
     """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     try:
-        # a_info 테이블 업데이트
-        # [수정] 이력 관리 로직 추가: MOD_DT, MOD_ID 업데이트
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
+
+        # ADMIN_CONFIRMED 행 보호: 해당 행 상태 확인
+        c.execute(
+            "SELECT CONFIRM_STATUS FROM a_info WHERE PDF_FILE_NAME = ? AND AUTHOR = ? AND AFFILIATION = ?",
+            (pdf_filename, author, affiliation)
+        )
+        row = c.fetchone()
+        if row and row[0] == 'ADMIN_CONFIRMED':
+            return False, "이 저자 정보는 관리자에 의해 확정되어 변경할 수 없습니다."
+
         query = """
-            UPDATE a_info 
-            SET 직원번호 = ?, 이름 = ?, MOD_DT = ?, MOD_ID = ?
+            UPDATE a_info
+            SET 직원번호 = ?, 이름 = ?, MOD_DT = ?, MOD_ID = ?,
+                CONFIRM_STATUS = 'USER_CLAIMED', CONFIRM_DT = ?, CONFIRM_ID = ?
             WHERE PDF_FILE_NAME = ? AND AUTHOR = ? AND AFFILIATION = ?
+              AND (CONFIRM_STATUS IS NULL OR CONFIRM_STATUS != 'ADMIN_CONFIRMED')
         """
-        c.execute(query, (user_id, user_name, current_time, user_id, pdf_filename, author, affiliation))
-        
+        c.execute(query, (user_id, user_name, current_time, user_id, current_time, user_id,
+                          pdf_filename, author, affiliation))
+
         if c.rowcount > 0:
             conn.commit()
+            add_activity_log(
+                action_type="USER_CLAIM",
+                actor_id=user_id,
+                actor_name=user_name,
+                target_table="a_info",
+                target_key=pdf_filename,
+                new_value={"AUTHOR": author, "CONFIRM_STATUS": "USER_CLAIMED",
+                           "직원번호": user_id, "이름": user_name},
+                memo=f"사용자가 저자 지정: AUTHOR={author}"
+            )
             return True, f"'{user_name}({user_id})' 님으로 지정되었습니다."
         else:
             return False, "일치하는 데이터를 찾을 수 없어 업데이트하지 못했습니다."
-            
+
     except Exception as e:
         conn.rollback()
         return False, f"업데이트 중 오류 발생: {e}"
     finally:
         conn.close()
 
+
+def unclaim_my_paper(pdf_filename, author, affiliation, user_id):
+    """사용자가 본인 논문 지정을 해제합니다. ADMIN_CONFIRMED 행은 해제 불가."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            "SELECT CONFIRM_STATUS, 이름 FROM a_info WHERE PDF_FILE_NAME = ? AND AUTHOR = ? AND AFFILIATION = ?",
+            (pdf_filename, author, affiliation)
+        )
+        row = c.fetchone()
+        if not row:
+            return False, "해당 데이터를 찾을 수 없습니다."
+        if row[0] == 'ADMIN_CONFIRMED':
+            return False, "관리자 확정 완료된 항목은 해제할 수 없습니다."
+
+        old_name = row[1]
+        query = """
+            UPDATE a_info
+            SET 직원번호 = NULL, MOD_DT = ?, MOD_ID = ?,
+                CONFIRM_STATUS = 'UNCONFIRMED', CONFIRM_DT = NULL, CONFIRM_ID = NULL
+            WHERE PDF_FILE_NAME = ? AND AUTHOR = ? AND AFFILIATION = ?
+              AND CONFIRM_STATUS != 'ADMIN_CONFIRMED'
+        """
+        c.execute(query, (current_time, user_id, pdf_filename, author, affiliation))
+        if c.rowcount > 0:
+            conn.commit()
+            add_activity_log(
+                action_type="USER_UNCLAIM",
+                actor_id=user_id,
+                target_table="a_info",
+                target_key=pdf_filename,
+                old_value={"AUTHOR": author, "CONFIRM_STATUS": "USER_CLAIMED", "이름": old_name},
+                new_value={"AUTHOR": author, "CONFIRM_STATUS": "UNCONFIRMED", "직원번호": None},
+                memo=f"사용자가 저자 지정 해제: AUTHOR={author}"
+            )
+            return True, "지정이 해제되었습니다."
+        return False, "해제에 실패했습니다."
+    except Exception as e:
+        conn.rollback()
+        return False, f"오류 발생: {e}"
+    finally:
+        conn.close()
+
+def confirm_paper_by_admin(pdf_filename, author, employee_id, employee_name, admin_id):
+    """관리자가 특정 저자 행을 특정 연구자로 확정합니다. CONFIRM_STATUS를 ADMIN_CONFIRMED로 설정합니다."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 변경 전 값 캡처
+        c.execute(
+            "SELECT 직원번호, 이름, CONFIRM_STATUS FROM a_info WHERE PDF_FILE_NAME = ? AND AUTHOR = ?",
+            (pdf_filename, author)
+        )
+        row = c.fetchone()
+        old_val = {"직원번호": row[0], "이름": row[1], "CONFIRM_STATUS": row[2]} if row else None
+
+        query = """
+            UPDATE a_info
+            SET 직원번호 = ?, 이름 = ?, MOD_DT = ?, MOD_ID = ?,
+                CONFIRM_STATUS = 'ADMIN_CONFIRMED', CONFIRM_DT = ?, CONFIRM_ID = ?
+            WHERE PDF_FILE_NAME = ? AND AUTHOR = ?
+        """
+        c.execute(query, (employee_id, employee_name, current_time, admin_id,
+                          current_time, admin_id, pdf_filename, author))
+        if c.rowcount > 0:
+            conn.commit()
+            add_activity_log(
+                action_type="ADMIN_CONFIRM",
+                actor_id=admin_id,
+                target_table="a_info",
+                target_key=pdf_filename,
+                old_value=old_val,
+                new_value={"AUTHOR": author, "CONFIRM_STATUS": "ADMIN_CONFIRMED",
+                           "직원번호": employee_id, "이름": employee_name},
+                memo=f"관리자 확정: AUTHOR={author}, 직원번호={employee_id}"
+            )
+            return True, "확정되었습니다."
+        return False, "해당 데이터를 찾을 수 없습니다."
+    except Exception as e:
+        conn.rollback()
+        return False, f"오류 발생: {e}"
+    finally:
+        conn.close()
+
+
+def unconfirm_paper_by_admin(pdf_filename, author, admin_id):
+    """관리자가 확정을 해제합니다. 직원번호/이름은 참조용으로 유지합니다."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute(
+            "SELECT 직원번호, 이름, CONFIRM_STATUS FROM a_info WHERE PDF_FILE_NAME = ? AND AUTHOR = ?",
+            (pdf_filename, author)
+        )
+        row = c.fetchone()
+        old_val = {"직원번호": row[0], "이름": row[1], "CONFIRM_STATUS": row[2]} if row else None
+
+        query = """
+            UPDATE a_info
+            SET MOD_DT = ?, MOD_ID = ?,
+                CONFIRM_STATUS = 'UNCONFIRMED', CONFIRM_DT = NULL, CONFIRM_ID = NULL
+            WHERE PDF_FILE_NAME = ? AND AUTHOR = ?
+        """
+        c.execute(query, (current_time, admin_id, pdf_filename, author))
+        if c.rowcount > 0:
+            conn.commit()
+            add_activity_log(
+                action_type="ADMIN_UNCONFIRM",
+                actor_id=admin_id,
+                target_table="a_info",
+                target_key=pdf_filename,
+                old_value=old_val,
+                new_value={"AUTHOR": author, "CONFIRM_STATUS": "UNCONFIRMED"},
+                memo=f"관리자 확정 해제: AUTHOR={author}"
+            )
+            return True, "확정이 해제되었습니다."
+        return False, "해당 데이터를 찾을 수 없습니다."
+    except Exception as e:
+        conn.rollback()
+        return False, f"오류 발생: {e}"
+    finally:
+        conn.close()
+
+
+def get_activity_log(action_type=None, actor_id=None, target_key=None,
+                     date_from=None, date_to=None, limit=500) -> pd.DataFrame:
+    """activity_log 테이블을 조건별로 조회합니다."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        conditions = []
+        params = []
+        if action_type and action_type != "전체":
+            conditions.append("ACTION_TYPE = ?")
+            params.append(action_type)
+        if actor_id:
+            conditions.append("ACTOR_ID LIKE ?")
+            params.append(f"%{actor_id}%")
+        if target_key:
+            conditions.append("TARGET_KEY LIKE ?")
+            params.append(f"%{target_key}%")
+        if date_from:
+            conditions.append("ACTION_DT >= ?")
+            params.append(str(date_from))
+        if date_to:
+            conditions.append("ACTION_DT <= ?")
+            params.append(str(date_to) + " 23:59:59")
+
+        where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"SELECT * FROM activity_log {where_sql} ORDER BY ACTION_DT DESC LIMIT {limit}"
+        df = pd.read_sql_query(query, conn, params=params)
+        return df
+    except Exception as e:
+        print(f"activity_log 조회 오류: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+
 def get_my_papers(user_name, user_id):
     """
-    a_info의 '이름'이 user_name과 일치하는 행을 찾고, 
+    a_info의 '이름'이 user_name과 일치하는 행을 찾고,
     해당 PDF_FILE_NAME을 기준으로 c_info의 상세 정보를 결합(JOIN)하여 반환합니다.
     """
     conn = sqlite3.connect(DB_FILE)
@@ -738,19 +1007,22 @@ def get_my_papers(user_name, user_id):
         # 1. a_info(a)와 c_info(c)를 PDF_FILE_NAME으로 조인
         # 2. 조건: a.이름 = 로그인한 사용자 이름 AND a.직원번호 = 아이디
         query = """
-            SELECT c.*, a.AUTHOR, a.ROLE, a.AFFILIATION, a.이름
+            SELECT c.*, a.AUTHOR, a.ROLE, a.AFFILIATION, a.이름, a.CONFIRM_STATUS
             FROM a_info a
             JOIN c_info c ON a.PDF_FILE_NAME = c.PDF_FILE_NAME
             WHERE a.이름 = ?
                 AND a.직원번호 = ?
             ORDER BY c.PUBLICATION_YEAR, c.TITLE, a.AUTHOR, a.ROLE
         """
-        
-        df = pd.read_sql_query(query, conn, params=(user_name,user_id,))
-        
+
+        df = pd.read_sql_query(query, conn, params=(user_name, user_id,))
+
         # 중복된 컬럼(PDF_FILE_NAME 등)이 있을 경우 제거
         df = df.loc[:, ~df.columns.duplicated()]
-        df = df[['AUTHOR', 'ROLE',  'AFFILIATION','TITLE','PUBLICATION_YEAR','JOURNAL_NAME','FIRST_AUTHOR','CORRESPONDING_AUTHOR','AUTHOR_LIST','VOLUME','ISSUE','PAGE','DOI','PDF_FILE_NAME']]
+        df = df[['AUTHOR', 'ROLE', 'AFFILIATION', 'CONFIRM_STATUS',
+                 'TITLE', 'PUBLICATION_YEAR', 'JOURNAL_NAME', 'FIRST_AUTHOR',
+                 'CORRESPONDING_AUTHOR', 'AUTHOR_LIST', 'VOLUME', 'ISSUE', 'PAGE', 'DOI',
+                 'ORI_FILE_NAME', 'PDF_FILE_NAME']]
         df = df.drop_duplicates(subset='TITLE', keep='first')
         return df
     except Exception as e:
@@ -782,8 +1054,13 @@ def update_or_add_paper_data(df, table_name, key_columns, user_id="AD00000"):
         
         # key_columns가 여러 개일 수 있으므로 동적 쿼리 생성
         where_clause = " AND ".join([f"{col} = ?" for col in key_columns])
-        select_query = f"SELECT {', '.join(key_columns)}, REG_DT, REG_ID FROM {table_name} WHERE {where_clause}"
-        
+        # a_info 테이블은 확정 상태 컬럼도 함께 보존
+        is_a_info = (table_name == "a_info")
+        if is_a_info:
+            select_query = f"SELECT {', '.join(key_columns)}, REG_DT, REG_ID, CONFIRM_STATUS, CONFIRM_DT, CONFIRM_ID FROM {table_name} WHERE {where_clause}"
+        else:
+            select_query = f"SELECT {', '.join(key_columns)}, REG_DT, REG_ID FROM {table_name} WHERE {where_clause}"
+
         for _, row in keys.iterrows():
             params = tuple(row[col] for col in key_columns)
             try:
@@ -792,8 +1069,11 @@ def update_or_add_paper_data(df, table_name, key_columns, user_id="AD00000"):
                 if res:
                     # 키 값을 튜플로 만들어서 딕셔너리 키로 사용
                     key_val = tuple(res[i] for i in range(len(key_columns)))
-                    # REG_DT(인덱스 -2), REG_ID(인덱스 -1)
-                    existing_reg_info[key_val] = {'REG_DT': res[-2], 'REG_ID': res[-1]}
+                    info = {'REG_DT': res[-2], 'REG_ID': res[-1]}
+                    if is_a_info:
+                        info = {'REG_DT': res[-5], 'REG_ID': res[-4],
+                                'CONFIRM_STATUS': res[-3], 'CONFIRM_DT': res[-2], 'CONFIRM_ID': res[-1]}
+                    existing_reg_info[key_val] = info
             except Exception:
                 pass # 테이블이 없거나 컬럼이 없을 경우 패스
 
@@ -806,17 +1086,32 @@ def update_or_add_paper_data(df, table_name, key_columns, user_id="AD00000"):
         # 행별로 순회하며 값 설정 (Apply보다 반복문이 명확함)
         for idx, row in df.iterrows():
             key_val = tuple(row[col] for col in key_columns)
-            
+
             # 기존 데이터가 있으면 REG 정보 복원
             if key_val in existing_reg_info:
                 df.at[idx, 'REG_DT'] = existing_reg_info[key_val]['REG_DT']
                 df.at[idx, 'REG_ID'] = existing_reg_info[key_val]['REG_ID']
-            
+                # a_info: 확정 상태 컬럼도 복원 (편집으로 확정 상태가 초기화되지 않도록)
+                if is_a_info:
+                    for conf_col in ['CONFIRM_STATUS', 'CONFIRM_DT', 'CONFIRM_ID']:
+                        saved_val = existing_reg_info[key_val].get(conf_col)
+                        if saved_val is not None and saved_val != '':
+                            if conf_col not in df.columns:
+                                df[conf_col] = None
+                            df.at[idx, conf_col] = saved_val
+
             # REG_DT가 없으면(신규) 현재 시간/ID 입력
             if pd.isna(df.at[idx, 'REG_DT']) or df.at[idx, 'REG_DT'] == '':
                 df.at[idx, 'REG_DT'] = current_time
                 df.at[idx, 'REG_ID'] = user_id
-            
+
+            # 신규 a_info 행의 확정 상태 기본값 설정
+            if is_a_info:
+                if 'CONFIRM_STATUS' not in df.columns:
+                    df['CONFIRM_STATUS'] = None
+                if pd.isna(df.at[idx, 'CONFIRM_STATUS']) or df.at[idx, 'CONFIRM_STATUS'] == '':
+                    df.at[idx, 'CONFIRM_STATUS'] = 'UNCONFIRMED'
+
             # MOD_DT, MOD_ID는 무조건 갱신
             df.at[idx, 'MOD_DT'] = current_time
             df.at[idx, 'MOD_ID'] = user_id
@@ -1972,13 +2267,32 @@ def show_main_app_page():
                         edited_a["SAVE_DATE"] = current_time
                         
                         if '이름' not in edited_a.columns: edited_a['이름'] = None
-                        if '직원번호' not in edited_a.columns: edited_a['직원번호'] = None                       
-                        edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = user_name
-                        edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = st.session_state.username
-                        # [수정] 본인을 선택한 경우에만 이름/직원번호 매핑 수행
+                        if '직원번호' not in edited_a.columns: edited_a['직원번호'] = None
+                        if 'CONFIRM_STATUS' not in edited_a.columns: edited_a['CONFIRM_STATUS'] = 'UNCONFIRMED'
+                        if 'CONFIRM_DT' not in edited_a.columns: edited_a['CONFIRM_DT'] = None
+                        if 'CONFIRM_ID' not in edited_a.columns: edited_a['CONFIRM_ID'] = None
+
                         if selected_myself != "선택안함":
-                            edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = user_name
-                            edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = st.session_state.username
+                            if st.session_state.username == "AD00000":
+                                # 관리자 업로드: 선택한 영문이름으로 직원 조회
+                                matched_users = search_users_by_name_by_eng(selected_myself)
+                                if matched_users:
+                                    res_emp_id = matched_users[0]['id']
+                                    res_emp_name = matched_users[0]['name']
+                                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = res_emp_name
+                                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = res_emp_id
+                                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, 'CONFIRM_STATUS'] = 'ADMIN_CONFIRMED'
+                                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, 'CONFIRM_DT'] = current_time
+                                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, 'CONFIRM_ID'] = st.session_state.username
+                                else:
+                                    st.warning(f"⚠️ '{selected_myself}'에 해당하는 직원번호를 찾을 수 없습니다. 인명검색으로 확인 후 저장하세요.")
+                            else:
+                                # 일반 사용자 업로드: 본인 정보로 USER_CLAIMED
+                                edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = user_name
+                                edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = st.session_state.username
+                                edited_a.loc[edited_a['AUTHOR'] == selected_myself, 'CONFIRM_STATUS'] = 'USER_CLAIMED'
+                                edited_a.loc[edited_a['AUTHOR'] == selected_myself, 'CONFIRM_DT'] = current_time
+                                edited_a.loc[edited_a['AUTHOR'] == selected_myself, 'CONFIRM_ID'] = st.session_state.username
                         key_cols = ["PDF_FILE_NAME"]
                         
                         try:
@@ -1999,6 +2313,16 @@ def show_main_app_page():
                         a_saved = update_or_add_paper_data(edited_a, "a_info", key_cols, user_id=st.session_state.username)
 
                         if c_saved and a_saved:
+                            # 업로드 활동 로그
+                            add_activity_log(
+                                action_type="UPLOAD",
+                                actor_id=st.session_state.username,
+                                actor_name=user_name,
+                                target_table="c_info",
+                                target_key=os.path.basename(st.session_state.get("temp_file_path", "")),
+                                new_value={"ORI_FILE_NAME": st.session_state.get("uploaded_file_name", "")},
+                                memo="관리자 직접 업로드 저장" if st.session_state.username == "AD00000" else "사용자 직접 업로드 저장"
+                            )
                             st.session_state.show_save_success = True
                             st.session_state.editing = False
                             st.session_state.c_paper_info_original = edited_c.copy()
@@ -2545,7 +2869,7 @@ def show_my_papers_page():
             user_name = user_data[0] 
             user_id = user_data[1] 
             df_base = get_my_papers(user_name, user_id)
-            display_cols = ['AUTHOR', 'ROLE', 'AFFILIATION', 'TITLE', 'PUBLICATION_YEAR', 'JOURNAL_NAME', 'DOI', 'PDF_FILE_NAME']
+            display_cols = ['AUTHOR', 'ROLE', 'AFFILIATION', 'CONFIRM_STATUS', 'TITLE', 'PUBLICATION_YEAR', 'JOURNAL_NAME', 'DOI', 'PDF_FILE_NAME']
         else:
             st.error("사용자 프로필 정보를 불러올 수 없습니다.")
             return
@@ -2695,12 +3019,18 @@ def show_my_papers_page():
             df_view = df_view.reset_index(drop=True)
             df_view['연번'] = df_view.index + 1
 
+            # CONFIRM_STATUS 한국어 변환
+            if 'CONFIRM_STATUS' in df_view.columns:
+                status_kor = {'USER_CLAIMED': '사용자확정', 'ADMIN_CONFIRMED': '관리자확정', 'UNCONFIRMED': '미확정'}
+                df_view['CONFIRM_STATUS'] = df_view['CONFIRM_STATUS'].map(lambda v: status_kor.get(str(v).strip(), '미확정'))
+
             valid_cols = [c for c in display_cols if c in df_view.columns]
-            
+
             rename_map = {
-                'TITLE': '논문 제목', 'PUBLICATION_YEAR': '발행년도', 'JOURNAL_NAME': '저널명', 
+                'TITLE': '논문 제목', 'PUBLICATION_YEAR': '발행년도', 'JOURNAL_NAME': '저널명',
                 'SEARCH_AUTHORS': '저자 목록 (영문/한글)', 'AUTHOR_LIST': '저자 목록',
-                'AUTHOR': '저자', 'ROLE': '역할', 'AFFILIATION': '소속', 'DOI': 'DOI'
+                'AUTHOR': '저자', 'ROLE': '역할', 'AFFILIATION': '소속', 'DOI': 'DOI',
+                'CONFIRM_STATUS': '확정상태'
             }
             final_view = df_view[['연번'] + valid_cols].rename(columns=rename_map)
 
@@ -2873,9 +3203,12 @@ def show_my_papers_page():
                     if "show_del_reason_ui" not in st.session_state:
                         st.session_state.show_del_reason_ui = False
 
-                    # col_save, col_cancel, col_del_req = st.columns([0.4, 0.3, 0.3])
-                    # [수정] 하단 버튼 배치: 저장, 취소, 삭제신청, 인명검색 (요구사항 1)
-                    col_save, col_cancel, col_del_req, col_hr = st.columns([0.25, 0.25, 0.25, 0.25])
+                    # 하단 버튼 배치 (사용자: 확정취소 추가 / 관리자: 기존 유지)
+                    if is_admin:
+                        col_save, col_cancel, col_del_req, col_hr = st.columns([0.25, 0.25, 0.25, 0.25])
+                        col_unclaim = None
+                    else:
+                        col_save, col_cancel, col_unclaim, col_del_req, col_hr = st.columns([0.2, 0.2, 0.2, 0.2, 0.2])
 
                     # [저장]
                     with col_save:
@@ -2904,6 +3237,15 @@ def show_my_papers_page():
                                 a_saved = update_or_add_paper_data(edited_a, "a_info", key_cols, user_id=st.session_state.username)
                                 
                                 if c_saved and a_saved:
+                                    pdf_key = key_cols[0] if key_cols else ""
+                                    pdf_key_val = c_df_final[pdf_key].iloc[0] if pdf_key in c_df_final.columns else ""
+                                    add_activity_log(
+                                        action_type="EDIT_C_INFO",
+                                        actor_id=st.session_state.username,
+                                        target_table="c_info",
+                                        target_key=str(pdf_key_val),
+                                        memo="나의논문 페이지에서 서지정보 수정"
+                                    )
                                     st.success("✅ 수정사항이 저장되었습니다.")
                                     st.session_state.admin_paper_editing = False
                                     st.rerun()
@@ -2918,6 +3260,31 @@ def show_my_papers_page():
                             st.session_state.admin_paper_editing = False
                             st.session_state.show_del_reason_ui = False
                             st.rerun()
+
+                    # [확정취소] — 사용자 전용
+                    if col_unclaim is not None:
+                        with col_unclaim:
+                            if st.button("🔓 확정취소", use_container_width=True, type="secondary"):
+                                my_rows = a_df_edit[a_df_edit['직원번호'].astype(str).str.strip() == str(st.session_state.username)]
+                                if my_rows.empty:
+                                    st.warning("이 논문에서 본인과 연결된 저자 정보가 없습니다.")
+                                else:
+                                    unclaim_ok = False
+                                    for _, my_row in my_rows.iterrows():
+                                        ok, msg = unclaim_my_paper(
+                                            pdf_fname,
+                                            str(my_row.get('AUTHOR', '')),
+                                            str(my_row.get('AFFILIATION', '')),
+                                            st.session_state.username
+                                        )
+                                        if ok:
+                                            unclaim_ok = True
+                                        else:
+                                            st.error(msg)
+                                    if unclaim_ok:
+                                        st.session_state.admin_paper_editing = False
+                                        st.session_state.target_pdf_row_idx = None
+                                        st.rerun()
 
                     with col_del_req:
                         # [추가] 삭제 신청 버튼
@@ -2960,7 +3327,17 @@ def show_my_papers_page():
                                 if not del_reason.strip():
                                     st.error("사유를 입력해야 합니다.")
                                 else:
-                                    if request_paper_deletion(pdf_fname, row.get("ORI_FILE_NAME", ""), del_reason, st.session_state.username):
+                                    # ORI_FILE_NAME: row에서 가져오되 비어있으면 c_info에서 직접 조회
+                                    _ori = str(row.get("ORI_FILE_NAME", "") or "").strip()
+                                    if not _ori:
+                                        try:
+                                            _c = sqlite3.connect(DB_FILE)
+                                            _r = _c.execute("SELECT ORI_FILE_NAME FROM c_info WHERE PDF_FILE_NAME=?", (pdf_fname,)).fetchone()
+                                            _ori = _r[0] if _r and _r[0] else ""
+                                            _c.close()
+                                        except Exception:
+                                            pass
+                                    if request_paper_deletion(pdf_fname, _ori, del_reason, st.session_state.username):
                                         st.success("✅ 삭제 신청이 접수되었습니다.")
                                         st.session_state.show_del_reason_ui = False
                                         st.session_state.admin_paper_editing = False
@@ -3067,9 +3444,9 @@ def show_settings_page():
     tabs_list = ["🔐 계정 및 보안"]
     if st.session_state.username == "AD00000":
         tabs_list.append("🎨 화면 설정 (관리자)")
-        # [추가] 데이터 관리 탭 추가
         tabs_list.append("🗄️ 데이터 관리 (관리자)")
-    
+        tabs_list.append("📋 활동 로그 (관리자)")
+
     tabs = st.tabs(tabs_list)
 
     # [탭 1] 계정 및 보안
@@ -3251,7 +3628,65 @@ cursor: default;">
                 with col4:
                     with st.expander(f"Resolved 폴더에만 있음 (DB 데이터 누락) - ({len(res['orphan_resolved'])}건)", expanded=True):
                         st.write(res['orphan_resolved'] if res['orphan_resolved'] else "없음")
-            # ---------- [여기까지 추가] ----------            
+            # ---------- [여기까지 추가] ----------
+
+    # [탭 4] 활동 로그 (관리자 전용)
+    if st.session_state.username == "AD00000" and len(tabs) > 3:
+        with tabs[3]:
+            st.markdown("#### 활동 로그 조회")
+            action_types = ["전체", "UPLOAD", "EDIT_C_INFO", "EDIT_A_INFO",
+                            "USER_CLAIM", "USER_UNCLAIM", "ADMIN_CONFIRM", "ADMIN_UNCONFIRM",
+                            "DELETE_REQUEST", "DELETE_APPROVE", "PDF_CHANGE_REQUEST", "PDF_CHANGE_APPROVE"]
+            with st.form("log_filter_form"):
+                col1, col2, col3 = st.columns(3)
+                log_action = col1.selectbox("액션 유형", action_types)
+                log_actor = col2.text_input("수행자 ID")
+                log_key = col3.text_input("PDF 파일명 (부분)")
+                col4, col5, _ = st.columns(3)
+                log_date_from = col4.date_input("시작일", value=None)
+                log_date_to = col5.date_input("종료일", value=None)
+                submitted = st.form_submit_button("🔍 조회", type="primary")
+
+            log_df = get_activity_log(
+                action_type=log_action if log_action != "전체" else None,
+                actor_id=log_actor if log_actor else None,
+                target_key=log_key if log_key else None,
+                date_from=log_date_from,
+                date_to=log_date_to,
+            )
+            if log_df.empty:
+                st.info("조건에 맞는 로그가 없습니다.")
+            else:
+                st.markdown(f"총 **{len(log_df)}**건 (최신순)")
+                event = st.dataframe(
+                    log_df[['ACTION_DT', 'ACTION_TYPE', 'ACTOR_ID', 'ACTOR_NAME',
+                            'TARGET_TABLE', 'TARGET_KEY', 'MEMO']],
+                    use_container_width=True,
+                    hide_index=True,
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="log_df_sel"
+                )
+                sel_rows = event.selection["rows"]
+                if sel_rows:
+                    sel = log_df.iloc[sel_rows[0]]
+                    with st.expander("📄 상세 (변경 전/후 값)", expanded=True):
+                        col_old, col_new = st.columns(2)
+                        with col_old:
+                            st.markdown("**변경 전 (OLD_VALUE)**")
+                            try:
+                                old_parsed = json.loads(sel['OLD_VALUE']) if sel['OLD_VALUE'] else {}
+                                st.json(old_parsed)
+                            except Exception:
+                                st.text(sel['OLD_VALUE'])
+                        with col_new:
+                            st.markdown("**변경 후 (NEW_VALUE)**")
+                            try:
+                                new_parsed = json.loads(sel['NEW_VALUE']) if sel['NEW_VALUE'] else {}
+                                st.json(new_parsed)
+                            except Exception:
+                                st.text(sel['NEW_VALUE'])
+
 
 def show_my_info_page():
     """내정보 수정 페이지를 표시합니다."""
@@ -3632,7 +4067,32 @@ def show_my_info_page():
                             if s_id not in ['none', 'nan', '', 'nat']:
                                 is_claimed = True
 
-                        if not is_claimed:
+                        # 확정 상태 확인
+                        confirm_status = str(row.get("CONFIRM_STATUS", "UNCONFIRMED") or "UNCONFIRMED").strip()
+                        status_label = {"USER_CLAIMED": "사용자확정", "ADMIN_CONFIRMED": "관리자확정"}.get(confirm_status, "미확정")
+
+                        if confirm_status == "ADMIN_CONFIRMED":
+                            st.info(f"관리자 확정 완료 ({status_label}) — 직원번호: {current_emp_id}")
+                        elif is_claimed:
+                            st.info(f"이미 지정됨 ({status_label}, 직원번호: {current_emp_id})")
+                            # 본인이 지정한 경우 해제 허용
+                            if str(current_emp_id) == str(st.session_state.username):
+                                if st.button("지정 해제", key=f"unclaim_btn_{idx}"):
+                                    success, msg = unclaim_my_paper(
+                                        pdf_fname, author_in_row, affiliation_in_row,
+                                        st.session_state.username
+                                    )
+                                    if success:
+                                        st.session_state.author_search_results.at[idx, '직원번호'] = None
+                                        st.session_state.author_search_results.at[idx, '이름'] = None
+                                        if 'CONFIRM_STATUS' in st.session_state.author_search_results.columns:
+                                            st.session_state.author_search_results.at[idx, 'CONFIRM_STATUS'] = 'UNCONFIRMED'
+                                        st.session_state.just_claimed_idx = None
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+
+                        if not is_claimed and confirm_status != "ADMIN_CONFIRMED":
                             if st.button("내 논문으로 지정 (직원번호 연동) 🙋‍♂️", key="claim_btn"):
                                 search_target_name = user_data["name"] 
                                 matches = search_users_by_name(search_target_name, None)
@@ -3680,8 +4140,6 @@ def show_my_info_page():
                                         "idx": idx 
                                     }
                                     st.rerun()
-                        else:
-                            st.info(f"이미 지정됨 (직원번호: {current_emp_id})")
 
             if st.session_state.get("claim_candidates"):
                 st.markdown("---")
@@ -3768,7 +4226,16 @@ def show_receipt_processing_page():
             return False
 
         with st.spinner(f"'{target_ori_name}' 분석 중..."):
-            json_data, error = get_pdf_json(file_path, PDF_SERVICE_URL, REQUEST_TIMEOUT)
+            # --- [수정] 접속 가능한 서버 확인 ---
+            active_url = get_active_pdf_service_url()
+            
+            if not active_url:
+                st.error("🚨 **PDF 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
+            else:
+                with st.spinner(f"PDF 분석 중... (연결된 서버: {active_url})"):
+                    json_data, error = get_pdf_json(file_path, active_url, REQUEST_TIMEOUT)
+
+            # json_data, error = get_pdf_json(file_path, PDF_SERVICE_URL, REQUEST_TIMEOUT)
             if not json_data:
                 st.error(f"분석 실패: {error}")
                 return False
@@ -4019,31 +4486,51 @@ def show_receipt_processing_page():
                             st.error("데이터에 이메일 정보가 없습니다.")
 
         # 선택된 항목 삭제
+        # 수정 이력:
+        #   - 기존: DELETE FROM u_info → 행이 완전 소멸, c_info/a_info 미삭제
+        #   - 변경: UPDATE u_info SET DONE=1 (처리완료 유지) + c_info/a_info 삭제 추가
         with col_btn2:
             if st.button("🗑️ 선택된 항목 삭제", type="primary", key="delete_items_btn"):
-                conn = sqlite3.connect(DB_FILE)
-                cur = conn.cursor()
                 deleted_count = 0
-                try:
-                    progress_bar = st.progress(0)
-                    total = len(selected_rows)
-                    for i, (_, row) in enumerate(selected_rows.iterrows()):
-                        target_pdf_name = row["PDF_FILE_NAME"]
-                        cur.execute("DELETE FROM u_info WHERE PDF_FILE_NAME = ?", (target_pdf_name,))
-                        delete_paper_files(target_pdf_name)                                               
+                error_msgs = []
+                progress_bar = st.progress(0)
+                total = len(selected_rows)
+
+                for i, (_, row) in enumerate(selected_rows.iterrows()):
+                    pdf_val = str(row["PDF_FILE_NAME"]).strip()
+                    try:
+                        # DB: c_info/a_info 삭제 + u_info 처리완료(DONE=1) - with로 자동 commit
+                        with sqlite3.connect(DB_FILE) as _conn:
+                            _cur = _conn.cursor()
+                            _cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                            c_del = _cur.rowcount
+                            _cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                            a_del = _cur.rowcount
+                            # u_info는 삭제하지 않고 처리완료(DONE=1)로 표시
+                            _cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                        # DB 성공 후 파일 삭제
+                        delete_paper_files(pdf_val)
+                        add_activity_log(
+                            action_type="DELETE_APPROVE",
+                            actor_id=st.session_state.username,
+                            target_table="c_info",
+                            target_key=pdf_val,
+                            memo=f"관리자 일괄 삭제 (c_info:{c_del}건, a_info:{a_del}건)"
+                        )
                         deleted_count += 1
-                        progress_bar.progress((i + 1) / total)
-                    conn.commit()
-                    st.success(f"{deleted_count}건 삭제되었습니다.")
-                    st.session_state.receipt_analysis_done = False
-                    st.session_state.receipt_target_pdf = None
-                    st.session_state.receipt_target_old_pdf = None
-                    st.session_state.receipt_editing = False
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"삭제 중 오류 발생: {e}")
-                finally:
-                    conn.close()
+                    except Exception as e:
+                        error_msgs.append(f"{pdf_val}: {e}")
+                    progress_bar.progress((i + 1) / total)
+
+                if error_msgs:
+                    st.error("일부 오류:\n" + "\n".join(error_msgs))
+                if deleted_count > 0:
+                    st.success(f"{deleted_count}건 삭제되었습니다. (처리완료 목록에서 확인 가능)")
+                st.session_state.receipt_analysis_done = False
+                st.session_state.receipt_target_pdf = None
+                st.session_state.receipt_target_old_pdf = None
+                st.session_state.receipt_editing = False
+                st.rerun()
 
         # 다중/단일 분석 시작 버튼
         if len(selected_indices) > 1:
@@ -4078,22 +4565,44 @@ def show_receipt_processing_page():
                 st.warning("이 버튼을 누르면 해당 논문의 DB 정보와 물리적 파일이 모두 영구 삭제됩니다.")
                 
                 if st.button("🗑️ 삭제 승인 (DB 및 파일 영구 삭제)", type="primary", use_container_width=True, key="approve_delete_btn"):
-                    is_success = False
+                    pdf_val = str(pdf_to_handle).strip()
+                    requester_id = requester_name = ""
+                    c_del = a_del = 0
+                    db_ok = False
+
+                    # Step 1: DB 삭제 (with 컨텍스트 매니저 → 자동 commit/rollback)
                     try:
-                        conn = sqlite3.connect(DB_FILE)
-                        cur = conn.cursor()
-                        cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
-                        cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
-                        delete_paper_files(pdf_to_handle)
-                        cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
-                        conn.commit()
-                        conn.close()
-                        is_success = True
+                        with sqlite3.connect(DB_FILE) as _conn:
+                            _cur = _conn.cursor()
+                            _cur.execute("SELECT AUTHOR, ID FROM u_info WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                            _u = _cur.fetchone()
+                            requester_id = _u[1] if _u else ""
+                            requester_name = _u[0] if _u else ""
+                            _cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                            c_del = _cur.rowcount
+                            _cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                            a_del = _cur.rowcount
+                            _cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (pdf_val,))
+                        db_ok = True
                     except Exception as e:
-                        st.error(f"삭제 처리 중 오류 발생: {e}")
-                    
+                        st.error(f"DB 삭제 오류: {e}")
+
+                    # Step 2: 파일 삭제 및 로그 (DB 성공 후)
+                    if db_ok:
+                        delete_paper_files(pdf_val)
+                        add_activity_log(
+                            action_type="DELETE_APPROVE",
+                            actor_id=st.session_state.username,
+                            target_table="c_info",
+                            target_key=pdf_val,
+                            old_value={"요청자ID": requester_id, "요청자명": requester_name},
+                            memo=f"관리자 삭제 승인 (c_info:{c_del}건 a_info:{a_del}건)"
+                        )
+
+                    is_success = db_ok
+
                     if is_success:
-                        st.success("✅ 해당 논문의 모든 데이터가 정상적으로 삭제되었습니다.")
+                        st.success(f"✅ 삭제 완료 (c_info:{c_del}건, a_info:{a_del}건)")
                         import time; time.sleep(0.5)
                         if st.session_state.get("receipt_multi_mode"):
                             st.session_state.receipt_multi_current_index += 1
@@ -4277,6 +4786,28 @@ def show_receipt_processing_page():
                     a_saved = update_or_add_paper_data(df_a_to_save, "a_info", key_cols, user_id=st.session_state.username)
                     
                     if c_saved and a_saved:
+                        # 선택된 저자에 대해 관리자 확정 자동 적용
+                        _confirm_author = locals().get('clean_selected_author') or ''
+                        _confirm_emp_id = locals().get('target_user_id_to_save') or ''
+                        _confirm_name = locals().get('target_author_name') or ''
+                        if _confirm_author and _confirm_emp_id:
+                            confirm_paper_by_admin(
+                                pdf_to_handle, _confirm_author,
+                                _confirm_emp_id, _confirm_name,
+                                st.session_state.username
+                            )
+                        # 업로드/PDF교체 구분 활동 로그
+                        cur_u = sqlite3.connect(DB_FILE).cursor()
+                        cur_u.execute("SELECT OLD_FILE_NAME, ROLE FROM u_info WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
+                        u_row = cur_u.fetchone()
+                        log_action_type = "PDF_CHANGE_APPROVE" if (u_row and u_row[1] == "PDF_CHANGE_REQUEST") else "UPLOAD"
+                        add_activity_log(
+                            action_type=log_action_type,
+                            actor_id=st.session_state.username,
+                            target_table="c_info",
+                            target_key=pdf_to_handle,
+                            memo=f"관리자 접수처리 저장: {log_action_type}"
+                        )
                         try:
                             conn = sqlite3.connect(DB_FILE)
                             cur = conn.cursor()
@@ -4288,7 +4819,7 @@ def show_receipt_processing_page():
                                     cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (old_pdf,))
                                     cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (old_pdf,))
                                     delete_paper_files(old_pdf)
-                                                        
+
                             cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
                             conn.commit()
                             
@@ -4321,11 +4852,49 @@ def show_receipt_processing_page():
             doi_value = st.session_state.receipt_c_info.loc[st.session_state.receipt_c_info["Key"] == "DOI", "Value"]
             if not doi_value.empty:
                 st.link_button("🔗 DOI URL", url=doi_value.iloc[0])
-            
-            view_cols = ["ROLE", "AUTHOR", "AFFILIATION", "직원번호", "이름", "소속", "부서"]
+
+            view_cols = ["ROLE", "AUTHOR", "AFFILIATION", "직원번호", "이름", "CONFIRM_STATUS", "소속", "부서"]
             available_view_cols = [c for c in view_cols if c in st.session_state.receipt_a_info.columns]
             st.dataframe(st.session_state.receipt_a_info[available_view_cols], use_container_width=True)
-            
+
+            # 관리자 확정 버튼 영역
+            a_view = st.session_state.receipt_a_info
+            if '직원번호' in a_view.columns and 'AUTHOR' in a_view.columns:
+                st.markdown("---")
+                st.markdown("##### 저자 확정 관리")
+                status_label_map = {'USER_CLAIMED': '사용자확정', 'ADMIN_CONFIRMED': '관리자확정', 'UNCONFIRMED': '미확정'}
+                for vi, vrow in a_view.iterrows():
+                    v_author = str(vrow.get('AUTHOR', '') or '')
+                    v_emp_id = str(vrow.get('직원번호', '') or '').strip()
+                    v_name = str(vrow.get('이름', '') or '').strip()
+                    v_status = str(vrow.get('CONFIRM_STATUS', 'UNCONFIRMED') or 'UNCONFIRMED').strip()
+                    status_kor = status_label_map.get(v_status, '미확정')
+                    vcol_info, vcol_btn = st.columns([0.7, 0.3])
+                    vcol_info.markdown(f"`{v_author}` — {v_name} ({v_emp_id}) — **{status_kor}**")
+                    if v_emp_id and v_emp_id not in ['', 'None', 'nan']:
+                        if v_status != 'ADMIN_CONFIRMED':
+                            if vcol_btn.button("확정", key=f"adm_confirm_{vi}_{pdf_to_handle}"):
+                                ok, msg = confirm_paper_by_admin(
+                                    pdf_to_handle, v_author, v_emp_id, v_name, st.session_state.username
+                                )
+                                if ok:
+                                    if 'CONFIRM_STATUS' in st.session_state.receipt_a_info.columns:
+                                        st.session_state.receipt_a_info.at[vi, 'CONFIRM_STATUS'] = 'ADMIN_CONFIRMED'
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+                        else:
+                            if vcol_btn.button("확정 해제", key=f"adm_unconfirm_{vi}_{pdf_to_handle}"):
+                                ok, msg = unconfirm_paper_by_admin(
+                                    pdf_to_handle, v_author, st.session_state.username
+                                )
+                                if ok:
+                                    if 'CONFIRM_STATUS' in st.session_state.receipt_a_info.columns:
+                                        st.session_state.receipt_a_info.at[vi, 'CONFIRM_STATUS'] = 'UNCONFIRMED'
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+
             col_edit, col_close = st.columns([0.5, 0.5])
             with col_edit:
                 if st.button("편집", key="receipt_edit_btn"):
@@ -4335,7 +4904,7 @@ def show_receipt_processing_page():
                 if st.button("닫기 (분석 종료)", key="receipt_close_btn"):
                     st.session_state.receipt_analysis_done = False
                     st.session_state.receipt_target_pdf = None
-                    st.session_state.receipt_target_old_pdf = None 
+                    st.session_state.receipt_target_old_pdf = None
                     st.rerun()
 
     if st.session_state.get("receipt_success_msg"):
@@ -4378,5 +4947,5 @@ def main():
         show_login_page()
 
 if __name__ == "__main__":
-    version = "1.0.8"
+    version = "1.0.9"
     main()

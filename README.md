@@ -1,6 +1,27 @@
 # paper-collector 논문수집기
 paper-collector (논문수집기)
 
+(260607) 1.0.8 논문 확정 기능 및 활동 로그 추가, 삭제 처리 버그 수정
+1) DB 스키마 추가
+   - a_info 테이블에 CONFIRM_STATUS / CONFIRM_DT / CONFIRM_ID 컬럼 추가 (UNCONFIRMED / USER_CLAIMED / ADMIN_CONFIRMED)
+   - activity_log 테이블 신규 생성 (ACTION_DT, ACTION_TYPE, ACTOR_ID, TARGET_TABLE, TARGET_KEY, OLD_VALUE, NEW_VALUE, MEMO)
+   - 기존 직원번호가 있는 a_info 행 → USER_CLAIMED 일괄 마이그레이션
+2) 논문 확정 기능
+   - 사용자 업로드: 저자 선택 시 USER_CLAIMED 상태 자동 설정
+   - 관리자 업로드: 선택한 영문이름으로 직원 조회 후 ADMIN_CONFIRMED 설정, 미조회 시 경고
+   - 나의논문 목록에 확정상태 컬럼 표시 (사용자확정 / 관리자확정 / 미확정)
+   - 나의논문 편집 모드에 [확정취소] 버튼 추가 (직원번호 해제, 미확정 전환)
+   - 관리자 접수처리 저장 시 ADMIN_CONFIRMED 자동 적용
+   - 관리자 접수처리 뷰 모드에 저자별 [확정] / [확정 해제] 버튼 추가
+   - 내정보 페이지: 확정상태 뱃지 표시, ADMIN_CONFIRMED 행 잠금, [지정 해제] 버튼 추가
+3) 활동 로그 기능
+   - 업로드(UPLOAD), 서지정보 편집(EDIT_C_INFO), 사용자 지정(USER_CLAIM/UNCLAIM), 관리자 확정(ADMIN_CONFIRM/UNCONFIRM), 삭제 승인(DELETE_APPROVE) 이벤트 기록
+   - 설정 페이지 관리자 전용 [활동 로그] 탭 추가 (액션 유형/수행자/PDF명/날짜 필터, 변경 전/후 값 상세 보기)
+4) 버그 수정
+   - 삭제 승인: with 컨텍스트 매니저로 자동 commit 보장, c_info/a_info 삭제 추가, 파일 삭제는 DB commit 후 실행
+   - 접수처리 [선택된 항목 삭제]: DELETE FROM u_info → UPDATE DONE=1 로 변경 (처리완료 목록 유지), c_info/a_info 삭제 추가
+   - 나의논문/전체논문 삭제 신청: ORI_FILE_NAME 미전달 문제 수정 (get_my_papers 컬럼 추가 + DB 직접 조회 보강)
+
 (260606) pdf 파서 선택 순서 지정
 1) 기본으로 병원내 파서 이용, 그 다음에 외부 파서 이용으로 순서 지정
 
