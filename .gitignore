@@ -4,6 +4,9 @@
 # 데이터베이스 파일 제외
 paper.db
 
+# 유지보수 관련 제어ㅣ
+ONBOARDING.md
+
 # (선택) 파이썬 캐시 파일 등 불필요한 파일 제외
 __pycache__/
 *.pyc
@@ -15,6 +18,7 @@ __pycache__/
 *.csv
 *.txt
 *.yaml
+*.zip
 uploaded/
 resolved/
 .streamlit/
@@ -26,3 +30,5 @@ data/
 result/
 static/
 missing/
+저널정보/
+util/

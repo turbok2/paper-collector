@@ -1,6 +1,10 @@
 # paper-collector 논문수집기
 paper-collector (논문수집기)
 
+(260606) pdf 파서 선택 순서 지정
+1) 기본으로 병원내 파서 이용, 그 다음에 외부 파서 이용으로 순서 지정
+
+
 (260118-01) add database audit columns (REG_DT/ID, MOD_DT/ID) and update data handling logic to track creation and modification history
 1) a_ino, c_info, user_info 에 REG_DT REG_ID MOD_DT MOD_ID 컬럼이 없으면 추가
 2) REG_DT REG_ID 컬럼이 비어 있으면 현재날짜, AD00000 으로 채우기
@@ -42,3 +46,13 @@ user_info의 hname1, hname2, hname3, hname4 에 차례로 기록하는 코드 �
 
 (260412-02) 1.0.5 초록 전부 업데이트
 1) c_info에서 논문에 대해 초록 업데이트
+
+(260414-01) 1.0.6 PDF 파일변경 신청
+1) 사용자 : PDF 파일변경 신청 - 기존 정보 이용하기
+2) 관리자 : 파일변경 신청 기능 추가
+3) 관리자,사용자 : 삭제신청 기능
+4) 사용자 : 편집 기능, 인명검색 기능
+
+(260415-01) 1.0.7 관리기능 추가
+1) 관리자 : 설정 - 중복논문검사, 폴더별 파일 무결성검사 기능 추가
+2) 전체논문 - 편집 - 인명검색 추가, 소속에 chonnam  있으면 해당 셀 강조, CSV 다운로드 

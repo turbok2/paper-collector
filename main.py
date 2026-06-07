@@ -7,6 +7,7 @@ import sqlite3
 import bcrypt
 import json
 import pandas as pd
+import requests # <--- [추가] 접속 테스트를 위한 모듈 추가
 from get_paper_info import get_paper_df, get_pdf_json, extract_missing_abstract # <--- extract_missing_abstract 추가
 from name_change import korean_name_to_english
 import base64
@@ -29,6 +30,8 @@ load_dotenv(override=True)  # modify
 PDF_SERVICE_URL = os.getenv("PDF_SERVICE_URL")
 if not PDF_SERVICE_URL:
     raise ValueError("❌🔑❌ 'PDF_SERVICE_URL'가 .env 파일에 없습니다.")
+# [추가] PDF_SERVICE_URL2 환경변수 로드 (없어도 예외를 발생시키진 않음)
+PDF_SERVICE_URL2 = os.getenv("PDF_SERVICE_URL2")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT"))
 if not REQUEST_TIMEOUT:
     raise ValueError("❌🔑❌ 'REQUEST_TIMEOUT'가 .env 파일에 없습니다.")
@@ -296,7 +299,8 @@ def init_db():
             "EMAIL" TEXT,
             "DONE" TEXT,
             "OLD_FILE_NAME" TEXT,
-            "SAVE_DATE" TEXT
+            "SAVE_DATE" TEXT,
+            "INFO" TEXT 
         )
     """
     )
@@ -352,6 +356,11 @@ def init_db():
             "부서" TEXT
         )
     """)
+    # [추가] 기존 DB 업데이트를 위한 컬럼 존재 확인 및 추가
+    c.execute("PRAGMA table_info(u_info)")
+    u_info_columns = [col[1] for col in c.fetchall()]
+    if "INFO" not in u_info_columns:
+        c.execute("ALTER TABLE u_info ADD COLUMN INFO TEXT")
 
     # [수정] 이력 관리 컬럼 추가 (a_info, c_info, user_info)
     # user_info는 hr_info 역할도 겸함
@@ -385,6 +394,26 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+# -------------------------------------------------------------------------
+# [추가] hr_info 테이블에서 직원 검색 함수 (요구사항 3)
+# -------------------------------------------------------------------------
+def search_hr_info_by_name(query_name):
+    """hr_info 테이블에서 직원명으로 검색하여 결과를 반환합니다."""
+    if not query_name:
+        return pd.DataFrame()
+    
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        # 직원명 컬럼으로 부분 일치 검색
+        query = "SELECT 직원명, 직원번호, 소속, 부서 FROM hr_info WHERE 직원명 LIKE ?"
+        df = pd.read_sql_query(query, conn, params=(f"%{query_name}%",))
+        return df
+    except Exception as e:
+        print(f"hr_info 검색 오류: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
 
 #  검색 필터에 사용할 년도, 저널, 부서 목록을 DB에서 가져옵니다
 def get_filter_options():
@@ -1152,6 +1181,30 @@ def save_output_file(result, filename, model_name, OUTPUT_FOLDER):
         print(f"[❌❌] JSON_FAILED : {filename}\nError : {e}")
         return None, filename
 
+# -------------------------------------------------------------------------
+# [추가] 사용 가능한 PDF 서비스 URL 확인 및 자동 전환 함수
+# -------------------------------------------------------------------------
+def get_active_pdf_service_url():
+    """
+    메인 서버(PDF_SERVICE_URL) 접속을 먼저 시도하고, 실패 시 백업 서버(PDF_SERVICE_URL2)를 시도합니다.
+    접속 가능한 URL을 반환하며, 둘 다 실패하면 None을 반환합니다.
+    """
+    urls_to_try = [PDF_SERVICE_URL]
+    if PDF_SERVICE_URL2:
+        urls_to_try.append(PDF_SERVICE_URL2)
+        
+    for url in urls_to_try:
+        if not url: continue
+        try:
+            # 타임아웃 3초로 단순 연결 테스트 (응답이 오면 살아있는 서버로 간주)
+            requests.get(url, timeout=3)
+            return url
+        except requests.RequestException:
+            # 연결 실패 시 다음 URL 시도
+            continue
+            
+    return None
+
 # 3. 해시 계산 함수 (SHA-256)
 def calculate_hash(file_bytes):
     sha256_hash = hashlib.sha256()
@@ -1246,6 +1299,110 @@ def normalize_title(title):
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', str(title).lower())
 
 # -------------------------------------------------------------------------
+# [추가] 정규화된 TITLE을 기준으로 중복 논문을 찾는 함수
+# -------------------------------------------------------------------------
+def find_duplicate_papers_by_title():
+    """
+    c_info 테이블의 TITLE을 normalize_title로 정규화하여 비교하고,
+    중복된 논문들의 행(DataFrame)을 반환합니다.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        # c_info 데이터 전체 가져오기
+        query = "SELECT * FROM c_info"
+        df = pd.read_sql_query(query, conn)
+        
+        if df.empty or 'TITLE' not in df.columns:
+            return pd.DataFrame()
+            
+        # 정규화된 제목 컬럼을 임시로 추가
+        df['NORM_TITLE'] = df['TITLE'].apply(normalize_title)
+        
+        # 제목이 아예 없는(빈 문자열) 경우는 검사에서 제외
+        df_valid = df[df['NORM_TITLE'] != ""]
+        
+        # NORM_TITLE을 기준으로 중복된 모든 행 추출 (keep=False 옵션)
+        duplicates = df_valid[df_valid.duplicated(subset=['NORM_TITLE'], keep=False)]
+        
+        if not duplicates.empty:
+            # 동일한 논문끼리 묶어서 볼 수 있도록 NORM_TITLE 기준으로 정렬
+            duplicates = duplicates.sort_values(by=['NORM_TITLE', 'PUBLICATION_YEAR'])
+            # 임시로 만든 NORM_TITLE 컬럼은 결과에서 삭제
+            duplicates = duplicates.drop(columns=['NORM_TITLE'])
+            
+        return duplicates
+    except Exception as e:
+        print(f"중복 논문 검사 오류: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------------------
+# [추가] 폴더별 파일 무결성 검사 함수
+# -------------------------------------------------------------------------
+def check_file_discrepancies():
+    """
+    c_info의 PDF_FILE_NAME (.pdf 제외한 이름)과 
+    uploaded / resolved 폴더의 실제 파일을 비교하여 불일치 목록을 반환합니다.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        df = pd.read_sql_query("SELECT PDF_FILE_NAME FROM c_info", conn)
+        # .pdf를 제외한 base name (해시값 등) 추출
+        db_pdf_names = df['PDF_FILE_NAME'].dropna().astype(str).tolist()
+        db_names = set(name.replace('.pdf', '') for name in db_pdf_names if name.endswith('.pdf'))
+    except Exception as e:
+        print("DB read error:", e)
+        db_names = set()
+    finally:
+        conn.close()
+
+    # 1. uploaded 폴더 검사
+    uploaded_pdfs = set()
+    uploaded_jsons = set()
+    if os.path.exists(upload_folder):
+        for f in os.listdir(upload_folder):
+            if f.endswith('.pdf'):
+                uploaded_pdfs.add(f.replace('.pdf', ''))
+            elif f.endswith('.json'):
+                uploaded_jsons.add(f.replace('.json', ''))
+
+    # DB에만 있는 것 (Uploaded 폴더 누락)
+    db_missing_up_pdf = db_names - uploaded_pdfs
+    db_missing_up_json = db_names - uploaded_jsons
+
+    # Uploaded 폴더에만 있는 것 (DB 누락)
+    orphan_up_pdf = uploaded_pdfs - db_names
+    orphan_up_json = uploaded_jsons - db_names
+
+    # 2. resolved 폴더 검사
+    resolved_files = set()
+    if os.path.exists(resolve_folder):
+        resolved_files = set(f for f in os.listdir(resolve_folder) if f.endswith('.json'))
+
+    db_missing_resolved = set()
+    orphan_resolved = set()
+
+    # DB에만 있는 것 (Resolved 폴더에 name을 포함하는 파일이 아예 없는 경우)
+    for name in db_names:
+        if not any(name in f for f in resolved_files):
+            db_missing_resolved.add(name)
+
+    # Resolved 폴더에만 있는 것 (파일 이름에 db_names 중 어떤 것도 포함되지 않은 경우)
+    for f in resolved_files:
+        if not any(name in f for name in db_names):
+            orphan_resolved.add(f)
+
+    return {
+        "db_missing_up_pdf": sorted(list(db_missing_up_pdf)),
+        "db_missing_up_json": sorted(list(db_missing_up_json)),
+        "orphan_up_pdf": sorted(list(orphan_up_pdf)),
+        "orphan_up_json": sorted(list(orphan_up_json)),
+        "db_missing_resolved": sorted(list(db_missing_resolved)),
+        "orphan_resolved": sorted(list(orphan_resolved))
+    }
+
+# -------------------------------------------------------------------------
 # [추가] 3. 논문 제목 중복 확인 함수
 # -------------------------------------------------------------------------
 def check_title_duplicate_in_db(new_title, exclude_pdf_filename=None):
@@ -1318,34 +1475,6 @@ def display_pdf_viewer_button(pdf_filename):
     else:
         st.error("⚠️ 원본 PDF 파일이 서버에 없습니다.")
 
-# -------------------------------------------------------------------------
-# [추가] 2. PDF 파일 변경 신청 헬퍼 함수
-# -------------------------------------------------------------------------
-def request_pdf_change(new_pdf_filename, ori_file_name, old_pdf_filename, user_id):
-    """일반 사용자의 기존 논문 변경 요청을 u_info에 기록합니다."""
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    try:
-        save_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        user_info = get_user_by_id(user_id)
-        u_author = user_info[0] if user_info else ""
-        
-        cur.execute(
-            """
-            INSERT INTO u_info 
-            (ORI_FILE_NAME, PDF_FILE_NAME, AUTHOR, ROLE, EMAIL, DONE, SAVE_DATE, ID, OLD_FILE_NAME) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (ori_file_name, new_pdf_filename, u_author, "PDF_CHANGE_REQUEST", "", 0, save_date, user_id, old_pdf_filename)
-        )
-        conn.commit()
-        return True
-    except Exception as e:
-        print(f"Change request error: {e}")
-        return False
-    finally:
-        conn.close()
-
 # 4. 파일 저장 로직
 def save_paper(uploaded_file, upload_folder):
     # 파일 내용을 바이트로 읽음
@@ -1382,6 +1511,102 @@ def get_duplicate_paper_info(pdf_filename):
         return df
     except Exception as e:
         return pd.DataFrame()  # 에러 시 빈 데이터프레임 반환
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------------------
+# [추가] a_info에서 특정 논문의 작성자 정보를 가져오는 헬퍼 함수
+# -------------------------------------------------------------------------
+def get_paper_a_info_details(pdf_filename):
+    """PDF 파일명으로 a_info에서 직원번호가 있는 저자 정보를 가져옵니다."""
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        query = "SELECT AUTHOR, 직원번호, 이름, 소속, 부서 FROM a_info WHERE PDF_FILE_NAME = ? AND 직원번호 IS NOT NULL AND 직원번호 != ''"
+        # [해결] params 파라미터를 추가하여 ? 에 pdf_filename 값을 바인딩합니다.
+        df = pd.read_sql_query(query, conn, params=(pdf_filename,))
+        return df
+    except Exception as e:
+        print(f"a_info 조회 오류: {e}")
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------------------
+# [수정] 2. PDF 파일 변경 신청 헬퍼 함수 (요구사항 1, 2, 3 반영)
+# -------------------------------------------------------------------------
+def request_pdf_change(new_pdf_filename, ori_file_name, old_pdf_filename, current_user_id):
+    """
+    논문 변경 요청을 u_info에 기록합니다. 
+    기존 논문의 저자 정보를 INFO 필드에 JSON으로 저장하며, 관리자일 경우 정보를 자동 할당합니다.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    try:
+        save_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # [요구사항 1] a_info에서 해당 논문의 직원번호가 있는 데이터 추출
+        a_info_df = get_paper_a_info_details(old_pdf_filename)
+        
+        info_str = ""
+        u_author = ""
+        u_id = current_user_id
+
+        if not a_info_df.empty:
+            # 정보를 JSON 형태로 변환
+            info_str = a_info_df.to_json(orient='records', force_ascii=False)
+            # [요구사항 2] 사용자가 AD00000(관리자)이면 기존 저자 정보의 첫 번째 사람 정보를 사용
+            if current_user_id == "AD00000":
+                first_row = a_info_df.iloc[0]
+                u_id = str(first_row['직원번호'])
+                u_author = str(first_row['이름'])
+        
+        # 관리자가 아니거나, 관리자지만 기존 정보를 찾지 못한 경우 현재 세션 정보 사용
+        if not u_author:
+            user_info = get_user_by_id(current_user_id)
+            u_author = user_info[0] if user_info else ""
+
+        # [요구사항 4] INFO 필드를 포함하여 DB에 저장
+        cur.execute(
+            """
+            INSERT INTO u_info 
+            (ORI_FILE_NAME, PDF_FILE_NAME, AUTHOR, ID, ROLE, EMAIL, DONE, SAVE_DATE, OLD_FILE_NAME, INFO) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ori_file_name, new_pdf_filename, u_author, u_id, "PDF_CHANGE_REQUEST", "", 0, save_date, old_pdf_filename, info_str)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Change request error: {e}")
+        return False
+    finally:
+        conn.close()
+
+# -------------------------------------------------------------------------
+# [추가] 3. 논문 삭제 신청 헬퍼 함수
+# -------------------------------------------------------------------------
+def request_paper_deletion(pdf_filename, ori_file_name, reason, user_id):
+    """논문 삭제 요청을 u_info에 기록합니다."""
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    try:
+        save_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_info = get_user_by_id(user_id)
+        u_author = user_info[0] if user_info else ""
+        
+        cur.execute(
+            """
+            INSERT INTO u_info 
+            (ORI_FILE_NAME, PDF_FILE_NAME, AUTHOR, ID, ROLE, EMAIL, DONE, SAVE_DATE, INFO) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ori_file_name, pdf_filename, u_author, user_id, "PDF_DELETE_REQUEST", "", 0, save_date, reason)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Deletion request error: {e}")
+        return False
     finally:
         conn.close()
 
@@ -1515,9 +1740,14 @@ def show_main_app_page():
         if not st.session_state.get("last_json_path") or \
             os.path.basename(file_path).split(".")[0] not in st.session_state.get("last_json_path", ""):
 
-            with st.spinner("PDF 분석 중..."):
-                json_data, error = get_pdf_json(file_path, PDF_SERVICE_URL, REQUEST_TIMEOUT)
-
+            # --- [수정] 접속 가능한 서버 확인 ---
+            active_url = get_active_pdf_service_url()
+            
+            if not active_url:
+                st.error("🚨 **PDF 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
+            else:
+                with st.spinner(f"PDF 분석 중... (연결된 서버: {active_url})"):
+                    json_data, error = get_pdf_json(file_path, active_url, REQUEST_TIMEOUT)
             st.session_state.last_uploaded_pdf_path = file_path
 
             if json_data:
@@ -1557,14 +1787,29 @@ def show_main_app_page():
                         {"Key": "JSON_FILE_NAME", "Value": json_name},
                         {"Key": "LLM_JSON_FILE_NAME", "Value": llm_json_name},
                     ])
-                    c_info = pd.concat([c_info.drop(14, errors="ignore"), new_rows], ignore_index=True)
+                    # c_info = pd.concat([c_info.drop(15, errors="ignore"), new_rows], ignore_index=True)
+                    # concat 후 Key 컬럼 기준으로 중복된 행을 제거 (나중에 추가된 정보를 우선함)
+                    c_info = pd.concat([c_info, new_rows], ignore_index=True).drop_duplicates(subset=['Key'], keep='last')
                     
                     a_info["ORI_FILE_NAME"] = ori_pdf_name
                     a_info["PDF_FILE_NAME"] = pdf_name
                     a_info["JSON_FILE_NAME"] = json_name
                     a_info["LLM_JSON_FILE_NAME"] = llm_json_name
                     
-                    a_info = a_info[['AUTHOR', 'AFFILIATION', 'ROLE', 'ORI_FILE_NAME','PDF_FILE_NAME', 'JSON_FILE_NAME','LLM_JSON_FILE_NAME']]
+                    # a_info = a_info[['AUTHOR', 'AFFILIATION', 'ROLE', 'ORI_FILE_NAME','PDF_FILE_NAME', 'JSON_FILE_NAME','LLM_JSON_FILE_NAME']]
+                    # [추가/수정] 표시할 컬럼 확보 (없을 경우 대비)
+                    for col in ["직원번호", "이름", "소속", "부서"]:
+                        if col not in a_info.columns:
+                            a_info[col] = None
+
+                    # [수정] 요청하신 순서대로 컬럼 재배치 (ROLE 다음에 직원번호, 이름, 소속, 부서)
+                    desired_order = [
+                        'AUTHOR', 'AFFILIATION', 'ROLE', 
+                        '직원번호', '이름', '소속', '부서',  # <--- 이 부분 순서 조정
+                        'ORI_FILE_NAME', 'PDF_FILE_NAME', 'JSON_FILE_NAME', 'LLM_JSON_FILE_NAME'
+                    ]
+                    # 실제 존재하는 컬럼만 필터링하여 순서 적용
+                    a_info = a_info[[c for c in desired_order if c in a_info.columns]]
                     
                     st.session_state.json_data = json_data
                     st.session_state.a_paper_info = a_info
@@ -1706,59 +1951,114 @@ def show_main_app_page():
             )
             st.write("") 
 
-            col1, col2 = st.columns([0.5, 0.5])
+            # col1, col2 = st.columns([0.5, 0.5])
+            # [수정] 버튼 배치: 저장, 취소, 인명검색 (요구사항 2)
+            col_save, col_cancel, col_hr = st.columns([0.3, 0.3, 0.4])
             
-            if col1.button("저장", key="save_btn"):
-                if selected_myself == "선택안함":
-                    st.error("이 논문의 저자 중 본인을 선택하세요")
-                else:
-                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    df_c_transposed = edited_c.set_index("Key").T.reset_index(drop=True)
-                    df_c_transposed["SAVE_DATE"] = current_time
-                    edited_a["SAVE_DATE"] = current_time
+            
+            # if col1.button("저장", key="save_btn"):
+            with col_save:
+                # [버튼 복구] 버튼을 눌렀을 때만 아래 저장 로직이 실행되도록 합니다.
+                if st.button("💾 저장", key="save_btn", type="primary", use_container_width=True):                
+                    # [수정] 관리자(AD00000)가 아니면서 '선택안함'인 경우에만 에러 출력
+                    if st.session_state.username != "AD00000" and selected_myself == "선택안함":
+                        st.error("이 논문의 저자 중 본인을 선택하세요")
+                    else:
+                        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        # df_c_transposed = edited_c.set_index("Key").T.reset_index(drop=True)
+                        # 수정 후 (안전하게 중복 제거 후 전치)
+                        df_c_transposed = edited_c.drop_duplicates(subset=['Key'], keep='last').set_index("Key").T.reset_index(drop=True)
+                        df_c_transposed["SAVE_DATE"] = current_time
+                        edited_a["SAVE_DATE"] = current_time
+                        
+                        if '이름' not in edited_a.columns: edited_a['이름'] = None
+                        if '직원번호' not in edited_a.columns: edited_a['직원번호'] = None                       
+                        edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = user_name
+                        edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = st.session_state.username
+                        # [수정] 본인을 선택한 경우에만 이름/직원번호 매핑 수행
+                        if selected_myself != "선택안함":
+                            edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = user_name
+                            edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = st.session_state.username
+                        key_cols = ["PDF_FILE_NAME"]
+                        
+                        try:
+                            conn = sqlite3.connect(DB_FILE)
+                            cur = conn.cursor()
+                            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='a_info'")
+                            if cur.fetchone():
+                                cur.execute("PRAGMA table_info(a_info)")
+                                columns = [info[1] for info in cur.fetchall()]
+                                if '이름' not in columns: cur.execute("ALTER TABLE a_info ADD COLUMN 이름 TEXT")
+                                if '직원번호' not in columns: cur.execute("ALTER TABLE a_info ADD COLUMN 직원번호 TEXT")
+                                conn.commit()
+                            conn.close()
+                        except Exception as e:
+                            print(f"Column check error: {e}")
+
+                        c_saved = update_or_add_paper_data(df_c_transposed, "c_info", key_cols, user_id=st.session_state.username)
+                        a_saved = update_or_add_paper_data(edited_a, "a_info", key_cols, user_id=st.session_state.username)
+
+                        if c_saved and a_saved:
+                            st.session_state.show_save_success = True
+                            st.session_state.editing = False
+                            st.session_state.c_paper_info_original = edited_c.copy()
+                            st.session_state.a_paper_info_original = edited_a.copy()
+                            st.rerun()
+
+            # if col2.button("취소", key="cancel_btn"):
+            with col_cancel:
+                if st.button("취소", key="cancel_btn", use_container_width=True):
+                    st.session_state.c_paper_info = st.session_state.c_paper_info_original
+                    st.session_state.a_paper_info = st.session_state.a_paper_info_original
+                    st.session_state.editing = False
+                    st.rerun()
+            with col_hr:
+                if st.button("🔍 인명검색", key="hr_search_popup_btn", use_container_width=True):
+                    st.session_state.show_hr_popup = True
+
+            # --- [수정] 인명검색 팝업 UI (엔터 키 지원을 위해 st.form 적용) ---
+            if st.session_state.get("show_hr_popup"):
+                with st.container(border=True):
+                    st.markdown("#### 🔍 직원 인명 검색")
                     
-                    if '이름' not in edited_a.columns: edited_a['이름'] = None
-                    if '직원번호' not in edited_a.columns: edited_a['직원번호'] = None                       
-                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, '이름'] = user_name
-                    edited_a.loc[edited_a['AUTHOR'] == selected_myself, '직원번호'] = st.session_state.username
-
-                    key_cols = ["PDF_FILE_NAME"]
+                    # 검색창과 검색 버튼을 하나의 폼으로 묶어 엔터 키 입력을 지원합니다.
+                    with st.form(key="hr_search_form_popup", clear_on_submit=False):
+                        col_in, col_btn = st.columns([0.8, 0.2])
+                        search_query = col_in.text_input("검색할 직원명을 입력하세요", placeholder="예: 홍길동", label_visibility="collapsed")
+                        submit_btn = col_btn.form_submit_button("검색", use_container_width=True)
+                        
+                        if submit_btn:
+                            if search_query:
+                                st.session_state.hr_search_results = search_hr_info_by_name(search_query)
+                            else:
+                                st.warning("이름을 입력하세요.")
                     
-                    try:
-                        conn = sqlite3.connect(DB_FILE)
-                        cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='a_info'")
-                        if cur.fetchone():
-                            cur.execute("PRAGMA table_info(a_info)")
-                            columns = [info[1] for info in cur.fetchall()]
-                            if '이름' not in columns: cur.execute("ALTER TABLE a_info ADD COLUMN 이름 TEXT")
-                            if '직원번호' not in columns: cur.execute("ALTER TABLE a_info ADD COLUMN 직원번호 TEXT")
-                            conn.commit()
-                        conn.close()
-                    except Exception as e:
-                        print(f"Column check error: {e}")
-
-                    c_saved = update_or_add_paper_data(df_c_transposed, "c_info", key_cols, user_id=st.session_state.username)
-                    a_saved = update_or_add_paper_data(edited_a, "a_info", key_cols, user_id=st.session_state.username)
-
-                    if c_saved and a_saved:
-                        st.session_state.show_save_success = True
-                        st.session_state.editing = False
-                        st.session_state.c_paper_info_original = edited_c.copy()
-                        st.session_state.a_paper_info_original = edited_a.copy()
+                    # 닫기 버튼은 폼 외부에 배치하여 독립적으로 작동하게 합니다.
+                    if st.button("닫기", key="hr_search_close_btn", use_container_width=False):
+                        st.session_state.show_hr_popup = False
+                        st.session_state.hr_search_results = None
                         st.rerun()
 
-            if col2.button("취소", key="cancel_btn"):
-                st.session_state.c_paper_info = st.session_state.c_paper_info_original
-                st.session_state.a_paper_info = st.session_state.a_paper_info_original
-                st.session_state.editing = False
-                st.rerun()
+                    # 결과 출력
+                    if "hr_search_results" in st.session_state and st.session_state.hr_search_results is not None:
+                        res_df = st.session_state.hr_search_results
+                        if not res_df.empty:
+                            st.write(f"검색 결과: 총 {len(res_df)}건")
+                            st.dataframe(res_df, use_container_width=True, hide_index=True)
+                            st.info("💡 위 정보를 참고하여 에디터(a_info)에 정보를 입력하세요.")
+                        else:
+                            st.info("검색 결과가 없습니다.")
+            # ------------------------------------------              
+
         else:
             st.dataframe(st.session_state.c_paper_info)
             doi_value = st.session_state.c_paper_info.loc[st.session_state.c_paper_info["Key"] == "DOI", "Value"]
             if not doi_value.empty:
                 st.link_button("🔗 DOI URL", url=doi_value.iloc[0])
-            st.dataframe(st.session_state.a_paper_info[["ROLE", "AUTHOR", "AFFILIATION"]])
+            # [수정] 조회 화면에서도 요청하신 컬럼 순서로 전체 표시되도록 수정
+            view_cols = ["AUTHOR", "AFFILIATION", "직원번호", "이름", "소속", "부서", "ROLE"]
+            available_view_cols = [c for c in view_cols if c in st.session_state.a_paper_info.columns]
+            st.dataframe(st.session_state.a_paper_info[available_view_cols], use_container_width=True)
 
             col_edit, col_reset2 = st.columns([0.5, 0.5])
             with col_edit:
@@ -2365,8 +2665,32 @@ def show_my_papers_page():
         # 결과 리스트 출력
         if df_view.empty:
             st.info("검색 결과가 없습니다.")
-        else:
-            st.success(f"총 {len(df_view)}건의 논문이 있습니다.")
+        else:            
+            # ---------------------------------------------------------
+            # [수정] 결과 건수 표시 및 엑셀 저장 버튼 (요구사항 3)
+            # ---------------------------------------------------------
+            col_count, col_excel = st.columns([0.7, 0.3])
+            with col_count:
+                st.success(f"총 {len(df_view)}건의 논문이 있습니다.")
+            
+            with col_excel:
+                # 파일 이름 생성: 2026-04-14T23-57_paper.csv 형식
+                now_str = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M")
+                file_name = f"{now_str}_paper.csv"
+                
+                # CSV 데이터 준비 (c_info의 모든 컬럼 포함을 위해 df_view 원본 사용)
+                # UTF-8-SIG는 엑셀에서 한글 깨짐을 방지합니다.
+                csv_data = df_view.to_csv(index=False).encode('utf-8-sig')
+                
+                st.download_button(
+                    label="📥 엑셀(CSV) 저장",
+                    data=csv_data,
+                    file_name=file_name,
+                    mime="text/csv",
+                    use_container_width=True
+                )            
+        # else:
+        #     st.success(f"총 {len(df_view)}건의 논문이 있습니다.")
             
             df_view = df_view.reset_index(drop=True)
             df_view['연번'] = df_view.index + 1
@@ -2425,57 +2749,22 @@ def show_my_papers_page():
                         else:
                             st.button("DOI 없음", disabled=True, use_container_width=True)
 
+                    # [수정] 3번째 버튼: PDF 파일 변경 신청 (공통)
                     with col3:
-                        if is_admin:
-                            if st.button("✏️ 논문 정보 편집/삭제 (관리자)", use_container_width=True, type="secondary"):
-                                st.session_state.admin_paper_editing = True
-                                st.session_state.admin_edit_target_pdf = pdf_fname
-                                st.rerun()
-                        else:
-                            if st.button("📤 PDF 파일 변경 신청", use_container_width=True, type="primary"):
-                                st.session_state.change_pdf_mode = not st.session_state.change_pdf_mode
-                    # [추가] PDF 삭제 기능 영역
+                        if st.button("📤 PDF 파일 변경 신청", use_container_width=True, type="primary"):
+                            st.session_state.change_pdf_mode = not st.session_state.change_pdf_mode
+
+                    # [수정] 4번째 버튼: 편집/삭제 (공통)
                     with col4:
-                        # 관리자는 col3에서 이미 "편집/삭제" 기능을 제공하므로 일반 사용자에게만 노출
-                        if not is_admin:
-                            if st.button("🗑️ PDF 삭제", use_container_width=True, type="primary"):
-                                try:
-                                    conn = sqlite3.connect(DB_FILE)
-                                    cur = conn.cursor()
-                                    
-                                    # 1. DB (c_info, a_info) 에서 현재 논문 데이터 삭제
-                                    cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (pdf_fname,))
-                                    cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (pdf_fname,))
-                                    conn.commit()
-                                    conn.close()
-                                    # 2. 파일 삭제
-                                    delete_paper_files(pdf_fname)
-                                    # # 2. 서버 스토리지에 있는 파일도 함께 삭제 (디스크 확보)
-                                    # pdf_path = os.path.join(upload_folder, pdf_fname)
-                                    # if os.path.exists(pdf_path):
-                                    #     os.remove(pdf_path)
-                                        
-                                    # json_fname = f"{os.path.splitext(pdf_fname)[0]}.json"
-                                    # json_path = os.path.join(upload_folder, json_fname)
-                                    # if os.path.exists(json_path):
-                                    #     os.remove(json_path)
-                                    # if os.path.exists(resolve_folder):
-                                    #     file_hash = os.path.splitext(pdf_fname)[0]
-                                    #     for f in os.listdir(resolve_folder):
-                                    #         if file_hash in f:
-                                    #             try: os.remove(os.path.join(resolve_folder, f))
-                                    #             except: pass                                        
+                        # 관리자와 사용자 모두 '편집/삭제' 메뉴로 진입하도록 통일
+                        label = "✏️ 논문 정보 편집/삭제 (관리자)" if is_admin else "✏️ 논문 정보 편집/삭제"
+                        if st.button(label, use_container_width=True, type="secondary"):
+                            st.session_state.admin_paper_editing = True
+                            st.session_state.admin_edit_target_pdf = pdf_fname
+                            st.rerun()                            
 
-                                    # 상태 변수 초기화 및 리스트 갱신
-                                    st.success(f"✅ 데이터가 성공적으로 삭제되었습니다: {title}")
-                                    st.session_state.target_pdf_row_idx = None
-                                    st.session_state.change_pdf_mode = False
-                                    st.rerun()
-                                    
-                                except Exception as e:
-                                    st.error(f"❌ 데이터 삭제 중 오류가 발생했습니다: {e}")
-
-                    if not is_admin and st.session_state.change_pdf_mode:
+                    # --- PDF 변경 신청 업로드 UI (관리자/사용자 공통) ---
+                    if st.session_state.change_pdf_mode:
                         st.info("💡 교체할 새로운 PDF 파일을 업로드하세요. (접수처리 메뉴로 전송됩니다)")
                         new_pdf = st.file_uploader("교체할 PDF 업로드", type=["pdf"], key="change_pdf_uploader")
                         
@@ -2488,31 +2777,19 @@ def show_my_papers_page():
                                 with open(save_path, "wb") as f:
                                     f.write(file_bytes)
                             
-                            try:
-                                conn = sqlite3.connect(DB_FILE)
-                                cur = conn.cursor()
-                                save_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                user_info = get_user_by_id(st.session_state.username)
-                                u_id = st.session_state.username
-                                u_author = user_info[0] if user_info else ""
-                                
-                                cur.execute(
-                                    """
-                                    INSERT INTO u_info 
-                                    (ORI_FILE_NAME, PDF_FILE_NAME, AUTHOR, ROLE, EMAIL, DONE, SAVE_DATE, ID, OLD_FILE_NAME) 
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """,
-                                    (new_pdf.name, new_pdf_filename, u_author, "PDF_CHANGE_REQUEST", "", 0, save_date, u_id, pdf_fname)
-                                )
-                                conn.commit()
-                                conn.close()
-                                st.success("✅ 변경 요청이 접수처리(관리자) 신청되었습니다.")
+                            user_id = st.session_state.username
+                            # [핵심] 위에서 만든 request_pdf_change 함수를 호출하여 신청 처리
+                            # 관리자(AD00000)인 경우 함수 내부에서 자동으로 기존 논문 저자 정보를 INFO에 담고
+                            # 제출자 ID를 첫 번째 저자의 정보로 할당합니다.
+                            if request_pdf_change(new_pdf_filename, new_pdf.name, pdf_fname, user_id):
+                                st.success("✅ 변경 요청이 접수처리(관리자) 메뉴로 전달되었습니다.")
                                 st.session_state.change_pdf_mode = False 
-                            except Exception as e:
-                                st.error(f"DB 저장 중 오류: {e}")
+                                st.rerun()
+                            else:
+                                st.error("⚠️ 변경 요청 처리 중 오류가 발생했습니다.")                          
 
                 # --- 2) 관리자 편집 모드 (편집 버튼 누른 후) ---
-                elif is_admin and st.session_state.admin_paper_editing and st.session_state.admin_edit_target_pdf == pdf_fname:
+                elif st.session_state.admin_paper_editing and st.session_state.admin_edit_target_pdf == pdf_fname:
                     st.markdown("---")
                     st.markdown(f"#### ✏️ 논문 정보 편집: {title}")
                     st.info("💡 'c_info'(서지정보)와 'a_info'(저자정보)를 직접 수정할 수 있습니다.")
@@ -2569,17 +2846,36 @@ def show_my_papers_page():
                     )
                     
                     st.markdown("**2. 저자정보 (a_info)**")
-                    # [수정] 앞의 5개, 뒤의 4개 컬럼 숨기기
                     a_cols_head = a_df_edit.columns[:5]
                     a_cols_tail = a_df_edit.columns[-4:]
                     a_cols_to_hide_all = list(a_cols_head) + list(a_cols_tail)
                     a_df_display = a_df_edit.drop(columns=a_cols_to_hide_all, errors='ignore')
-                    
+
+                    # ---------------------------------------------------------
+                    # [수정] st.data_editor 색상 미지원 한계 극복 (마커 컬럼 추가)
+                    # ---------------------------------------------------------
+                    # Streamlit의 편집기는 셀 색상 변경을 지원하지 않으므로,
+                    # 눈에 띄도록 'AFFILIATION' 컬럼 앞에 임시 표시 열을 추가합니다.
+                    if 'AFFILIATION' in a_df_display.columns:
+                        target_idx = a_df_display.columns.get_loc('AFFILIATION')
+                        a_df_display.insert(
+                            target_idx, 
+                            '📌 타겟', 
+                            a_df_display['AFFILIATION'].apply(lambda x: '✅ 전남대' if isinstance(x, str) and 'chonnam' in x.lower() else '')
+                        )
+
+                    # 편집기 적용 (행 추가/삭제 기능인 num_rows="dynamic" 복구)
                     edited_a = st.data_editor(a_df_display, key="admin_edit_a", num_rows="dynamic", use_container_width=True)
+                    # ---------------------------------------------------------
 
                     st.write("") 
+                    # 삭제 사유 입력란 상태 관리
+                    if "show_del_reason_ui" not in st.session_state:
+                        st.session_state.show_del_reason_ui = False
 
-                    col_save, col_cancel, col_delete = st.columns([0.4, 0.3, 0.3])
+                    # col_save, col_cancel, col_del_req = st.columns([0.4, 0.3, 0.3])
+                    # [수정] 하단 버튼 배치: 저장, 취소, 삭제신청, 인명검색 (요구사항 1)
+                    col_save, col_cancel, col_del_req, col_hr = st.columns([0.25, 0.25, 0.25, 0.25])
 
                     # [저장]
                     with col_save:
@@ -2588,13 +2884,12 @@ def show_my_papers_page():
                             try:
                                 # [수정] 전치된 c_info를 다시 원래의 가로 형태(DB 구조)로 복원
                                 # "Key" 컬럼을 인덱스로 설정하고 전치(.T)
-                                # c_df_restored = edited_c_transposed.set_index("Key").T
                                 c_df_restored_partial = edited_c_transposed.set_index("Key").T
                                 
-                                # [수정] 숨겨진 컬럼 복원 (c_info)
+                                # # [수정] 숨겨진 컬럼 복원 (c_info)
                                 c_df_final = c_df_edit.copy()
                                 for col in c_df_restored_partial.columns:
-                                    c_df_final[col] = c_df_restored_partial[col].values
+                                    c_df_final[col] = c_df_restored_partial[col].values                                
 
                                 # [수정] 숨겨진 컬럼 복원 (a_info)
                                 for col in a_cols_head:
@@ -2621,47 +2916,59 @@ def show_my_papers_page():
                     with col_cancel:
                         if st.button("❌ 취소", use_container_width=True):
                             st.session_state.admin_paper_editing = False
+                            st.session_state.show_del_reason_ui = False
                             st.rerun()
 
-                    # [삭제]
-                    with col_delete:
-                        if st.button("🗑️ 삭제 (파일 포함)", type="primary", use_container_width=True):
-                            try:
-                                conn = sqlite3.connect(DB_FILE)
-                                cur = conn.cursor()
-                                
-                                # 1. DB 삭제
-                                cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (pdf_fname,))
-                                cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (pdf_fname,))
-                                conn.commit()
-                                
-                                # 2. 파일 삭제
-                                delete_paper_files(pdf_fname)
-                                # pdf_path = os.path.join(upload_folder, pdf_fname)
-                                # if os.path.exists(pdf_path):
-                                #     os.remove(pdf_path)
-                                
-                                # json_fname = f"{os.path.splitext(pdf_fname)[0]}.json"
-                                # json_path = os.path.join(upload_folder, json_fname)
-                                # if os.path.exists(json_path):
-                                #     os.remove(json_path)
-                                
-                                # if os.path.exists(resolve_folder):
-                                #     file_hash = os.path.splitext(pdf_fname)[0]
-                                #     for f in os.listdir(resolve_folder):
-                                #         if file_hash in f:
-                                #             try: os.remove(os.path.join(resolve_folder, f))
-                                #             except: pass
+                    with col_del_req:
+                        # [추가] 삭제 신청 버튼
+                        if st.button("🗑️ 삭제 신청", type="primary", use_container_width=True):
+                            st.session_state.show_del_reason_ui = True
 
-                                conn.close()
-                                
-                                st.success(f"삭제 성공 : {title}")
-                                st.session_state.admin_paper_editing = False
+                    with col_hr:
+                        # [추가] 인명검색 버튼 추가
+                        if st.button("🔍 인명검색", use_container_width=True, key="admin_hr_search_btn"):
+                            st.session_state.show_hr_popup = True
+
+                    # [추가] 인명검색 팝업 UI (기존 함수 로직 재사용)
+                    if st.session_state.get("show_hr_popup"):
+                        with st.container(border=True):
+                            st.markdown("#### 🔍 직원 인명 검색")
+                            with st.form(key="admin_hr_search_form", clear_on_submit=False):
+                                col_in, col_btn = st.columns([0.8, 0.2])
+                                search_query = col_in.text_input("검색할 직원명을 입력하세요", key="admin_hr_input")
+                                if col_btn.form_submit_button("검색"):
+                                    if search_query:
+                                        st.session_state.hr_search_results = search_hr_info_by_name(search_query)
+                            
+                            if st.button("닫기", key="admin_hr_close"):
+                                st.session_state.show_hr_popup = False
+                                st.session_state.hr_search_results = None
+                                st.rerun()
+
+                            if "hr_search_results" in st.session_state and st.session_state.hr_search_results is not None:
+                                res_df = st.session_state.hr_search_results
+                                if not res_df.empty:
+                                    st.dataframe(res_df, use_container_width=True, hide_index=True)
+
+                    # 삭제 사유 입력 폼
+                    if st.session_state.show_del_reason_ui:
+                        with st.container(border=True):
+                            st.markdown("⚠️ **논문 삭제 신청**")
+                            del_reason = st.text_area("삭제 사유를 입력해주세요", key="paper_del_reason_input")
+                            c_ok, c_can = st.columns(2)
+                            if c_ok.button("신청 확인", type="primary", use_container_width=True):
+                                if not del_reason.strip():
+                                    st.error("사유를 입력해야 합니다.")
+                                else:
+                                    if request_paper_deletion(pdf_fname, row.get("ORI_FILE_NAME", ""), del_reason, st.session_state.username):
+                                        st.success("✅ 삭제 신청이 접수되었습니다.")
+                                        st.session_state.show_del_reason_ui = False
+                                        st.session_state.admin_paper_editing = False
+                                        st.rerun()
+                            if c_can.button("닫기", use_container_width=True):
+                                st.session_state.show_del_reason_ui = False
                                 st.rerun()
                                 
-                            except Exception as e:
-                                st.error(f"삭제 실패 : {title} ({e})")
-
     with tab_dash:
         show_dashboard(df_view, is_admin=is_admin)
 
@@ -2681,11 +2988,11 @@ def update_abstracts_batch():
         cursor.execute("ALTER TABLE c_info ADD COLUMN ABSTRACT TEXT")
         conn.commit()
 
-    # 2. 초록이 비어있거나 'NO_TEXT'인 데이터 조회 (JSON_FILE_NAME이 존재하는 것만)
+    # 2. 초록이 비어있거나 'NO ABSTRACT'인 데이터 조회 (JSON_FILE_NAME이 존재하는 것만)
     cursor.execute("""
         SELECT PDF_FILE_NAME, JSON_FILE_NAME, LLM_JSON_FILE_NAME
         FROM c_info
-        WHERE (ABSTRACT IS NULL OR ABSTRACT = '' OR ABSTRACT = 'NO_TEXT')
+        WHERE (ABSTRACT IS NULL OR ABSTRACT = '' OR ABSTRACT = 'NO ABSTRACT')
           AND JSON_FILE_NAME IS NOT NULL AND JSON_FILE_NAME != ''
     """)
     rows = cursor.fetchall()
@@ -2879,7 +3186,7 @@ cursor: default;">
                 with st.spinner("파일을 정리하는 중입니다..."):
                     deleted = cleanup_resolved_files()
                 st.success(f"✅ 정리 완료: 총 {deleted}개의 이전 중복 파일이 삭제되었습니다.")
-            # ---------- [여기서부터 아래 코드 추가] ----------
+
             st.markdown("---")
             st.markdown("#### 누락된 초록(ABSTRACT) 일괄 업데이트")
             st.info("💡 DB에서 초록이 비어있거나 'NO_TEXT'인 논문을 찾아 LLM으로 다시 분석하고, DB 및 결과 파일에 업데이트합니다.")
@@ -2891,7 +3198,60 @@ cursor: default;">
                     st.info("업데이트가 필요한 빈 초록 데이터가 없습니다.")
                 else:
                     st.success(f"🎉 총 {total_cnt}건 중 {success_cnt}건의 초록 업데이트가 완료되었습니다.")
-            # ---------- [여기까지 추가] ----------                
+
+            st.markdown("---")
+            st.markdown("#### 중복 논문 검사")
+            st.info("💡 DB에 등록된 논문들의 제목(TITLE)을 비교하여, 중복으로 등록된 논문이 있는지 검사합니다.")
+
+            if st.button("🔍 중복 논문 검사 실행", type="primary"):
+                with st.spinner("논문 제목을 비교하여 중복을 검사하고 있습니다..."):
+                    dup_df = find_duplicate_papers_by_title()
+                    
+                if dup_df.empty:
+                    st.success("🎉 중복으로 등록된 논문이 없습니다.")
+                else:
+                    st.warning(f"⚠️ 총 {len(dup_df)}건의 중복 의심 데이터(동일 제목)가 발견되었습니다.")
+                    
+                    # 관리자가 보기 편하도록 주요 컬럼만 우선 배치
+                    display_cols = ['TITLE', 'PDF_FILE_NAME', 'PUBLICATION_YEAR', 'JOURNAL_NAME', 'DOI']
+                    available_cols = [c for c in display_cols if c in dup_df.columns]
+                    remaining_cols = [c for c in dup_df.columns if c not in available_cols]
+                    
+                    # 데이터프레임 출력
+                    st.dataframe(dup_df[available_cols + remaining_cols], use_container_width=True, hide_index=True)
+            # ---------- [여기서부터 아래 코드 추가] ----------
+            st.markdown("---")
+            st.markdown("#### 📂 폴더별 파일 무결성 검사")
+            st.info("💡 DB(c_info)의 데이터와 `uploaded`, `resolved` 폴더의 실제 파일 존재 여부를 교차 검증합니다.")
+
+            if st.button("🔍 폴더별 파일 검사 실행", type="primary"):
+                with st.spinner("파일 및 DB 기록을 대조하고 있습니다..."):
+                    res = check_file_discrepancies()
+
+                st.markdown("##### 📁 Uploaded 폴더 검사 결과")
+                col1, col2 = st.columns(2)
+                with col1:
+                    with st.expander(f"DB에만 있음 (실제 파일 누락)", expanded=True):
+                        st.markdown(f"**PDF 누락 ({len(res['db_missing_up_pdf'])}건):**")
+                        st.write(res['db_missing_up_pdf'] if res['db_missing_up_pdf'] else "누락 없음")
+                        st.markdown(f"**JSON 누락 ({len(res['db_missing_up_json'])}건):**")
+                        st.write(res['db_missing_up_json'] if res['db_missing_up_json'] else "누락 없음")
+                with col2:
+                    with st.expander(f"Uploaded 폴더에만 있음 (DB 데이터 누락)", expanded=True):
+                        st.markdown(f"**DB에 없는 PDF ({len(res['orphan_up_pdf'])}건):**")
+                        st.write(res['orphan_up_pdf'] if res['orphan_up_pdf'] else "없음")
+                        st.markdown(f"**DB에 없는 JSON ({len(res['orphan_up_json'])}건):**")
+                        st.write(res['orphan_up_json'] if res['orphan_up_json'] else "없음")
+
+                st.markdown("##### 📁 Resolved 폴더 검사 결과")
+                col3, col4 = st.columns(2)
+                with col3:
+                    with st.expander(f"DB에만 있음 (Resolved 파일 누락) - ({len(res['db_missing_resolved'])}건)", expanded=True):
+                        st.write(res['db_missing_resolved'] if res['db_missing_resolved'] else "누락 없음")
+                with col4:
+                    with st.expander(f"Resolved 폴더에만 있음 (DB 데이터 누락) - ({len(res['orphan_resolved'])}건)", expanded=True):
+                        st.write(res['orphan_resolved'] if res['orphan_resolved'] else "없음")
+            # ---------- [여기까지 추가] ----------            
 
 def show_my_info_page():
     """내정보 수정 페이지를 표시합니다."""
@@ -3371,7 +3731,6 @@ def show_my_info_page():
             st.info("검색 결과가 없습니다.")
 
 
-# [누락된 함수 복구] 접수처리 페이지 함수
 def show_receipt_processing_page():
     st.subheader("접수 처리 (관리자)")
 
@@ -3382,18 +3741,25 @@ def show_receipt_processing_page():
         st.session_state.receipt_target_pdf = None
     if "receipt_editing" not in st.session_state:
         st.session_state.receipt_editing = False
-    # [추가] 다중 처리 모드 세션 상태
     if "receipt_multi_mode" not in st.session_state:
         st.session_state.receipt_multi_mode = False
 
-    # [추가] 분석 로직을 처리하는 내부 헬퍼 함수
+    # 분석 로직을 처리하는 내부 헬퍼 함수
     def _trigger_analysis(row_dict):
-        target_pdf_name = row_dict["PDF_FILE_NAME"]
-        target_ori_name = row_dict["ORI_FILE_NAME"]
-        target_author_name = row_dict["AUTHOR"]
-        target_id = row_dict.get("ID", "")
+        target_pdf_name = row_dict.get("PDF_FILE_NAME", "")
+        role = row_dict.get("ROLE", "")
 
-        # [추가] OLD_FILE_NAME 추출
+        # 삭제 요청(PDF_DELETE_REQUEST)인 경우 파일 검사 생략
+        if role == "PDF_DELETE_REQUEST":
+            st.session_state.receipt_target_pdf = target_pdf_name
+            st.session_state.receipt_target_author = row_dict.get("AUTHOR", "")
+            st.session_state.receipt_target_role = "PDF_DELETE_REQUEST"
+            st.session_state.receipt_target_info_json = row_dict.get("INFO", "")
+            st.session_state.receipt_analysis_done = True
+            return True
+
+        target_ori_name = row_dict.get("ORI_FILE_NAME", "")
+        target_id = row_dict.get("ID", "")
         target_old_file_name = row_dict.get("OLD_FILE_NAME", "") 
 
         file_path = os.path.join(upload_folder, target_pdf_name)
@@ -3429,25 +3795,53 @@ def show_receipt_processing_page():
                 {"Key": "JSON_FILE_NAME", "Value": json_filename},
                 {"Key": "LLM_JSON_FILE_NAME", "Value": llm_json_name},
             ])
-            c_info = pd.concat([c_info.drop(15, errors="ignore"), new_rows], ignore_index=True)
+            c_info = pd.concat([c_info, new_rows], ignore_index=True).drop_duplicates(subset=['Key'], keep='last')
             
             a_info["ORI_FILE_NAME"] = target_ori_name
             a_info["PDF_FILE_NAME"] = target_pdf_name
             a_info["JSON_FILE_NAME"] = json_filename
             a_info["LLM_JSON_FILE_NAME"] = llm_json_name
-            if '이름' not in a_info.columns: a_info['이름'] = None
-            a_info = a_info[['AUTHOR', 'AFFILIATION', 'ROLE', '이름', 'ORI_FILE_NAME','PDF_FILE_NAME', 'JSON_FILE_NAME','LLM_JSON_FILE_NAME']]
-            
+
+            # INFO 컬럼을 이용한 저자 정보 자동 채우기
+            target_info_json = row_dict.get("INFO", "")
+            for col in ["직원번호", "이름", "소속", "부서"]:
+                if col not in a_info.columns:
+                    a_info[col] = None
+
+            if target_info_json:
+                try:
+                    info_list = json.loads(target_info_json)
+                    if info_list:
+                        for idx, a_row in a_info.iterrows():
+                            new_author = str(a_row['AUTHOR']).strip()
+                            for info in info_list:
+                                if str(info.get('AUTHOR')).strip() == new_author:
+                                    a_info.at[idx, "직원번호"] = info.get("직원번호")
+                                    a_info.at[idx, "이름"] = info.get("이름")
+                                    a_info.at[idx, "소속"] = info.get("소속")
+                                    a_info.at[idx, "부서"] = info.get("부서")
+                                    break
+                except Exception as e:
+                    print(f"INFO mapping error: {e}")
+
+            # 컬럼 재배치
+            desired_order = ["ROLE", "AUTHOR", "AFFILIATION", "직원번호", "이름", "소속", "부서", 
+                             "ORI_FILE_NAME", "PDF_FILE_NAME", "JSON_FILE_NAME", "LLM_JSON_FILE_NAME"]
+            existing_cols = [c for c in desired_order if c in a_info.columns]
+            a_info = a_info[existing_cols]
+
             st.session_state.receipt_c_info = c_info
             st.session_state.receipt_a_info = a_info
             st.session_state.receipt_c_info_original = c_info.copy()
             st.session_state.receipt_a_info_original = a_info.copy()
             st.session_state.receipt_target_pdf = target_pdf_name
-            st.session_state.receipt_target_old_pdf = target_old_file_name # [추가] 세션에 저장
-            st.session_state.receipt_target_author = target_author_name
+            st.session_state.receipt_target_old_pdf = target_old_file_name 
+            st.session_state.receipt_target_author = row_dict.get("AUTHOR", "")
             st.session_state.receipt_target_id = target_id
+            st.session_state.receipt_target_role = role
             st.session_state.receipt_analysis_done = True
             st.session_state.receipt_editing = False
+            st.session_state.receipt_target_info_json = target_info_json
             return True
 
     # 1. 상단 필터
@@ -3473,7 +3867,6 @@ def show_receipt_processing_page():
     
     try:
         df = pd.read_sql_query(query, conn)
-        # DONE 컬럼 타입 강제 변환 (에러 방지)
         if 'DONE' in df.columns:
             df['DONE'] = pd.to_numeric(df['DONE'], errors='coerce').fillna(0).astype(int)        
     except Exception as e:
@@ -3486,7 +3879,6 @@ def show_receipt_processing_page():
     # 3. 테이블 표시 (멀티 선택)
     st.write(f"총 {len(df)}건")
     
-    # 컬럼 순서 재배치 (가독성)
     desired_order = ['ORI_FILE_NAME', 'AUTHOR', 'ID', 'ROLE', 'EMAIL', 'PDF_FILE_NAME', 'OLD_FILE_NAME', 'SAVE_DATE', 'DONE']
     available_cols = [c for c in desired_order if c in df.columns]
     remaining_cols = [c for c in df.columns if c not in available_cols]
@@ -3496,78 +3888,79 @@ def show_receipt_processing_page():
         df_display,
         use_container_width=True,
         hide_index=True,
-        selection_mode="multi-row" if not is_multi_mode else "single-row", # 다중 모드 중에는 선택 비활성화
+        selection_mode="multi-row" if not is_multi_mode else "single-row", 
         on_select="rerun",
         key="receipt_table"
     )
 
     selected_indices = event.selection.get("rows", [])
     
-    # [추가] 다중 처리 모드 진행 블록
+    # 4. 다중 처리 모드 진행 블록
     if is_multi_mode:
         idx = st.session_state.receipt_multi_current_index
         total = st.session_state.receipt_multi_total_count
 
-        # 모든 항목 처리 완료 시
         if idx >= total:
             st.success("✅ 다중 항목 분석이 모두 완료되었습니다.")
-            # 다중 모드 상태 초기화
             st.session_state.receipt_multi_mode = False
             del st.session_state.receipt_multi_queue
             del st.session_state.receipt_multi_current_index
             del st.session_state.receipt_multi_total_count
-            # 분석 상태 초기화
             if "receipt_analysis_done" in st.session_state: del st.session_state.receipt_analysis_done
             if "receipt_target_pdf" in st.session_state: del st.session_state.receipt_target_pdf
-            if "receipt_target_old_pdf" in st.session_state: del st.session_state.receipt_target_old_pdf # [추가]
+            if "receipt_target_old_pdf" in st.session_state: del st.session_state.receipt_target_old_pdf
             st.rerun()
 
-        # 진행 상태 표시 및 중단 버튼
         st.markdown("---")
         st.info(f"🚀 **다중 항목 분석**: [{idx + 1}/{total} 진행중]")
-        if st.button("⏹️ 다중 항목 분석 중단"):
+        if st.button("⏹️ 다중 항목 분석 중단", key="stop_multi_btn"):
             st.warning("분석을 중단합니다. 지금까지 저장된 내용은 유지됩니다.")
-            # 다중 모드 상태 초기화
             st.session_state.receipt_multi_mode = False
             del st.session_state.receipt_multi_queue
             del st.session_state.receipt_multi_current_index
             del st.session_state.receipt_multi_total_count
-            # 분석 상태 초기화
             if "receipt_analysis_done" in st.session_state: del st.session_state.receipt_analysis_done
             if "receipt_target_pdf" in st.session_state: del st.session_state.receipt_target_pdf
-            if "receipt_target_old_pdf" in st.session_state: del st.session_state.receipt_target_old_pdf # [추가]
+            if "receipt_target_old_pdf" in st.session_state: del st.session_state.receipt_target_old_pdf
             st.rerun()
 
         current_pdf_name = st.session_state.receipt_multi_queue[idx]
         
-        # 현재 아이템에 대한 분석이 아직 로드되지 않았다면 분석 실행
         if st.session_state.get("receipt_target_pdf") != current_pdf_name:
-            row = df[df['PDF_FILE_NAME'] == current_pdf_name].iloc[0]
-            if _trigger_analysis(row.to_dict()):
-                st.rerun()
-            else: # 분석 실패 시 다음으로
+            target_df = df[df['PDF_FILE_NAME'] == current_pdf_name]
+            
+            if not target_df.empty:
+                row = target_df.iloc[0]
+                if _trigger_analysis(row.to_dict()):
+                    st.rerun()
+                else: 
+                    st.warning(f"⚠️ '{current_pdf_name}' 파일 처리 중 오류가 발생하여 건너뜁니다.")
+                    import time; time.sleep(1.5)
+                    st.session_state.receipt_multi_current_index += 1
+                    st.rerun()
+            else:
+                st.warning(f"💡 해당 건은 앞선 작업에 의해 이미 처리되었습니다. 다음으로 넘어갑니다.")
+                import time; time.sleep(1.5)
                 st.session_state.receipt_multi_current_index += 1
                 st.rerun()
 
-    # 4. 하단 액션 버튼 (다중 모드가 아닐 때)
-    if selected_indices:
+    # 5. 하단 액션 버튼 (다중 모드가 아닐 때)
+    if selected_indices and not is_multi_mode:
         selected_rows = df.iloc[selected_indices]
         st.info(f"선택된 항목: {len(selected_rows)}건")
         
         col_btn1, col_btn2 = st.columns([0.7, 0.3])
 
-        # [버튼 1] 메일로 처리결과 전송
+        # 메일로 처리결과 전송
         with col_btn1:
             if filter_option == "처리완료" or filter_option == "전체":
-                if st.button("📧 메일로 처리결과 전송"):
+                if st.button("📧 메일로 처리결과 전송", key="send_email_btn"):
                     targets = selected_rows[selected_rows['DONE'] >= 1]
-                    
                     if targets.empty:
                         st.warning("선택된 항목 중 '처리완료'된 건이 없습니다.")
                     else:
                         if 'EMAIL' in targets.columns:
                             valid_targets = targets[targets['EMAIL'].notna() & (targets['EMAIL'] != "")]
-                            
                             if valid_targets.empty:
                                 st.warning("선택된 항목에 유효한 이메일 주소가 없습니다.")
                             else:
@@ -3583,25 +3976,16 @@ def show_receipt_processing_page():
                                     else:
                                         title_map = {}
                                 except Exception as e:
-                                    st.error(f"논문 제목 조회 중 오류: {e}")
                                     title_map = {}
 
                                 email_groups = {}
                                 for _, row in valid_targets.iterrows():
                                     email = row['EMAIL']
-                                    author = row['AUTHOR']
-                                    ori_filename = row['ORI_FILE_NAME']
-                                    pdf_filename = row['PDF_FILE_NAME']
-                                    paper_title = title_map.get(pdf_filename, "")
-                                    
-                                    if email not in email_groups:
-                                        email_groups[email] = []
-                                    
-                                    email_groups[email].append({
-                                        'author': author,
-                                        'title': paper_title,
-                                        'ori_filename': ori_filename,
-                                        'pdf_filename': pdf_filename
+                                    email_groups.setdefault(email, []).append({
+                                        'author': row['AUTHOR'],
+                                        'title': title_map.get(row['PDF_FILE_NAME'], ""),
+                                        'ori_filename': row['ORI_FILE_NAME'],
+                                        'pdf_filename': row['PDF_FILE_NAME']
                                     })
                                 
                                 success_count = 0
@@ -3613,27 +3997,20 @@ def show_receipt_processing_page():
                                     with st.spinner(f"{len(email_groups)}명에게 메일 전송 중..."):
                                         for email, details_list in email_groups.items():
                                             is_sent, msg = send_processing_result_email(email, details_list)
-                                            
                                             if is_sent:
                                                 success_count += 1
                                                 for item in details_list:
-                                                    cur.execute(
-                                                        "UPDATE u_info SET DONE = 2 WHERE PDF_FILE_NAME = ?", 
-                                                        (item['pdf_filename'],)
-                                                    )
+                                                    cur.execute("UPDATE u_info SET DONE = 2 WHERE PDF_FILE_NAME = ?", (item['pdf_filename'],))
                                             else:
                                                 fail_log.append(f"{email}: {msg}")
-                                    
                                     conn.commit()
                                     
                                     if success_count > 0:
                                         st.success(f"{success_count}명에게 메일 발송 및 상태 업데이트 완료!")
-                                        if fail_log:
-                                            st.error(f"일부 발송 실패:\n" + "\n".join(fail_log))
+                                        if fail_log: st.error(f"일부 발송 실패:\n" + "\n".join(fail_log))
                                         st.rerun()
                                     elif fail_log:
                                         st.error(f"발송 실패:\n" + "\n".join(fail_log))
-
                                 except Exception as e:
                                     st.error(f"작업 중 오류 발생: {e}")
                                 finally:
@@ -3641,70 +4018,113 @@ def show_receipt_processing_page():
                         else:
                             st.error("데이터에 이메일 정보가 없습니다.")
 
-        # [버튼 2] 삭제
+        # 선택된 항목 삭제
         with col_btn2:
-            if st.button("🗑️ 선택된 항목 삭제", type="primary"):
+            if st.button("🗑️ 선택된 항목 삭제", type="primary", key="delete_items_btn"):
                 conn = sqlite3.connect(DB_FILE)
                 cur = conn.cursor()
                 deleted_count = 0
-                
                 try:
                     progress_bar = st.progress(0)
                     total = len(selected_rows)
-                    
                     for i, (_, row) in enumerate(selected_rows.iterrows()):
                         target_pdf_name = row["PDF_FILE_NAME"]
                         cur.execute("DELETE FROM u_info WHERE PDF_FILE_NAME = ?", (target_pdf_name,))
-
-                        # 2. 파일 삭제
-                        delete_paper_files(target_pdf_name)                        
-                        # file_hash = os.path.splitext(target_pdf_name)[0]
-                        # if os.path.exists(upload_folder):
-                        #     for filename in os.listdir(upload_folder):
-                        #         if file_hash in filename:
-                        #             try: os.remove(os.path.join(upload_folder, filename))
-                        #             except: pass
-                        
+                        delete_paper_files(target_pdf_name)                                               
                         deleted_count += 1
                         progress_bar.progress((i + 1) / total)
-
                     conn.commit()
                     st.success(f"{deleted_count}건 삭제되었습니다.")
                     st.session_state.receipt_analysis_done = False
                     st.session_state.receipt_target_pdf = None
-                    st.session_state.receipt_target_old_pdf = None # [추가]
+                    st.session_state.receipt_target_old_pdf = None
                     st.session_state.receipt_editing = False
                     st.rerun()
-                    
                 except Exception as e:
                     st.error(f"삭제 중 오류 발생: {e}")
                 finally:
                     conn.close()
 
-    # 5. 다중/단일 분석 시작 버튼 (다중 모드가 아닐 때만 표시)
-    if selected_indices and not is_multi_mode:
+        # 다중/단일 분석 시작 버튼
         if len(selected_indices) > 1:
-            if st.button("🚀 다중 항목 분석 시작"):
-                selected_rows = df.iloc[selected_indices]
+            if st.button("🚀 다중 항목 분석 시작", key="multi_analyze_start_btn"):
                 st.session_state.receipt_multi_mode = True
                 st.session_state.receipt_multi_queue = selected_rows['PDF_FILE_NAME'].tolist()
                 st.session_state.receipt_multi_current_index = 0
                 st.session_state.receipt_multi_total_count = len(selected_rows)
-                # 이전 분석 상태 초기화
                 if "receipt_analysis_done" in st.session_state: del st.session_state.receipt_analysis_done
                 if "receipt_target_pdf" in st.session_state: del st.session_state.receipt_target_pdf
-                if "receipt_target_old_pdf" in st.session_state: del st.session_state.receipt_target_old_pdf # [추가]
+                if "receipt_target_old_pdf" in st.session_state: del st.session_state.receipt_target_old_pdf
                 st.rerun()
         elif len(selected_indices) == 1:
-            row = df.iloc[selected_indices[0]]
+            row = selected_rows.iloc[0]
             st.markdown("---")
             st.markdown(f"##### 🔍 단일 항목 분석: {row['ORI_FILE_NAME']}")
-            if st.button("서지정보 분석 (단일 항목)"):
+            if st.button("서지정보 분석 (단일 항목)", key="single_analyze_start_btn"):
                 if _trigger_analysis(row.to_dict()):
                     st.rerun()
 
     # 6. 분석 결과 표시 및 처리 (공통 UI)
     if st.session_state.get("receipt_analysis_done") and st.session_state.get("receipt_target_pdf"):
+        pdf_to_handle = st.session_state.receipt_target_pdf
+        target_role = st.session_state.get("receipt_target_role")
+        
+        # 삭제 요청 처리 화면
+        if target_role == "PDF_DELETE_REQUEST":
+            st.error(f"🚨 **논문 삭제 요청 건입니다.** (대상: {pdf_to_handle})")
+            with st.container(border=True):
+                st.markdown(f"**삭제 사유:**\n{st.session_state.get('receipt_target_info_json')}")
+                st.write("---")
+                st.warning("이 버튼을 누르면 해당 논문의 DB 정보와 물리적 파일이 모두 영구 삭제됩니다.")
+                
+                if st.button("🗑️ 삭제 승인 (DB 및 파일 영구 삭제)", type="primary", use_container_width=True, key="approve_delete_btn"):
+                    is_success = False
+                    try:
+                        conn = sqlite3.connect(DB_FILE)
+                        cur = conn.cursor()
+                        cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
+                        cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
+                        delete_paper_files(pdf_to_handle)
+                        cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
+                        conn.commit()
+                        conn.close()
+                        is_success = True
+                    except Exception as e:
+                        st.error(f"삭제 처리 중 오류 발생: {e}")
+                    
+                    if is_success:
+                        st.success("✅ 해당 논문의 모든 데이터가 정상적으로 삭제되었습니다.")
+                        import time; time.sleep(0.5)
+                        if st.session_state.get("receipt_multi_mode"):
+                            st.session_state.receipt_multi_current_index += 1
+                            st.session_state.receipt_analysis_done = False
+                            st.session_state.receipt_target_pdf = None
+                            st.session_state.receipt_target_old_pdf = None
+                            st.rerun()
+                        else:
+                            st.session_state.receipt_analysis_done = False
+                            st.rerun()
+            
+            if st.button("닫기 (건너뛰기)", key="close_delete_request_btn"):
+                if is_multi_mode:
+                    st.session_state.receipt_multi_current_index += 1
+                st.session_state.receipt_analysis_done = False
+                st.session_state.receipt_target_pdf = None
+                st.rerun()
+            st.stop() 
+
+        # INFO 필드에 저장된 기존 논문 저자 정보 표시
+        target_info_json = st.session_state.get("receipt_target_info_json", "")
+        if target_info_json:
+            try:
+                info_data = json.loads(target_info_json)
+                if info_data:
+                    with st.expander("🔗 연결된 기존 논문 저자 정보 (INFO)", expanded=True):
+                        st.markdown("이 변경 신청은 기존 논문의 다음 저자 정보와 연결되어 있습니다.")
+                        st.table(pd.DataFrame(info_data))
+            except:
+                pass        
+        
         st.markdown("---")
         st.subheader("📊 서지정보 분석 결과")
         
@@ -3719,20 +4139,15 @@ def show_receipt_processing_page():
             if 'AUTHOR' in edited_a.columns:
                 extracted_authors = edited_a['AUTHOR'].unique().tolist()
             
-            # 제출자 선택을 위한 세션 변수 초기화
             if 'receipt_chosen_user' not in st.session_state:
                 st.session_state.receipt_chosen_user = None
 
             chosen_user = st.session_state.receipt_chosen_user
 
-            # 아직 제출자가 확정되지 않은 경우, 매칭 로직 수행
             if not chosen_user:
-                # 1. 업로드 시 ID가 제공되었는지 확인
                 if target_id_from_upload and target_id_from_upload.strip():
                     user_by_id = get_user_by_id(target_id_from_upload)
-                    # ID로 사용자를 찾았고, 이름이 제출자명과 일치하는 경우
                     if user_by_id and user_by_id[0] == target_author_name:
-                        # search_users_by_name과 동일한 형식의 dict로 변환
                         chosen_user = {
                             'name': user_by_id[0], 'id': user_by_id[1], 'dep': user_by_id[8],
                             'hname1': user_by_id[11], 'hname2': user_by_id[12],
@@ -3740,14 +4155,12 @@ def show_receipt_processing_page():
                         }
                         st.session_state.receipt_chosen_user = chosen_user
 
-                # 2. ID로 찾지 못한 경우, 이름으로 검색
                 if not chosen_user:
                     matches = search_users_by_name(target_author_name)
                     if len(matches) == 1:
                         chosen_user = matches[0]
                         st.session_state.receipt_chosen_user = chosen_user
                     elif len(matches) > 1:
-                        # 3. 동명이인 중 영어 이름으로 자동 선택 시도
                         found_match = False
                         for user in matches:
                             eng_names = [user.get(f'hname{i}') for i in range(1, 5) if user.get(f'hname{i}')]
@@ -3759,7 +4172,6 @@ def show_receipt_processing_page():
                                     break
                             if found_match: break
                         
-                        # 4. 자동 선택 실패 시, 관리자에게 선택 요청
                         if not found_match:
                             st.warning(f"⚠️ 제출자 '{target_author_name}'에 해당하는 직원이 여러 명 검색되었습니다. 아래에서 올바른 제출자를 선택해주세요.")
                             options = {f"{u['name']} (ID: {u['id']}, 부서: {u['dep']})": u for u in matches}
@@ -3769,7 +4181,6 @@ def show_receipt_processing_page():
                                 st.rerun()
                             st.stop()
 
-            # 제출자가 확정된 후 UI 표시
             submitter_display = f"{target_author_name}"
             matched_eng_name = None
             if chosen_user:
@@ -3793,44 +4204,25 @@ def show_receipt_processing_page():
             col_save, col_cancel = st.columns([0.5, 0.5])
             
             with col_save:
-                if st.button("저장 (DB반영 및 완료처리)", type="primary"):
+                if st.button("저장 (DB반영 및 완료처리)", type="primary", key="save_receipt_btn"):
                     current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    # -------------------------------------------------------------
-                    # [추가] OLD_FILE_NAME 값이 있으면, 기존 DB 데이터 및 물리적 파일 삭제
-                    # -------------------------------------------------------------
                     old_pdf_filename = st.session_state.get("receipt_target_old_pdf")
                     if old_pdf_filename and str(old_pdf_filename).strip() not in ["", "None", "nan"]:
                         try:
                             conn_del = sqlite3.connect(DB_FILE)
                             cur_del = conn_del.cursor()
-                            
-                            # 1. DB에서 기존 논문 정보(c_info, a_info) 삭제
                             cur_del.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (old_pdf_filename,))
                             cur_del.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (old_pdf_filename,))
                             conn_del.commit()
                             conn_del.close()
-                            
-                            # 2. 기존 물리적 파일 (pdf, json) 삭제
-                            delete_paper_files(old_pdf_filename)
-                            # old_pdf_path = os.path.join(upload_folder, old_pdf_filename)
-                            # if os.path.exists(old_pdf_path):
-                            #     os.remove(old_pdf_path)
-                                
-                            # old_json_fname = f"{os.path.splitext(old_pdf_filename)[0]}.json"
-                            # old_json_path = os.path.join(upload_folder, old_json_fname)
-                            # if os.path.exists(old_json_path):
-                            #     os.remove(old_json_path)
-
-                            # if os.path.exists(resolve_folder):
-                            #     file_hash = os.path.splitext(old_pdf_filename)[0]
-                            #     for f in os.listdir(resolve_folder):
-                            #         if file_hash in f:
-                            #             try: os.remove(os.path.join(resolve_folder, f))
-                            #             except: pass                                             
+                            # 기존 파일과 교체할 새 파일이 동일한 경우에는 기존 파일들 삭제하지 않게
+                            _pdf_filename = st.session_state.get("receipt_target_pdf")
+                            if _pdf_filename != old_pdf_filename:
+                                delete_paper_files(old_pdf_filename)
                         except Exception as e:
                             print(f"기존 데이터 삭제 오류: {e}")
-                    # -------------------------------------------------------------                    
-                    df_c_transposed = edited_c.set_index("Key").T.reset_index(drop=True)
+                                            
+                    df_c_transposed = edited_c.drop_duplicates(subset=['Key'], keep='last').set_index("Key").T.reset_index(drop=True)
                     df_c_transposed["SAVE_DATE"] = current_time
                     
                     df_a_to_save = edited_a.copy()
@@ -3845,32 +4237,16 @@ def show_receipt_processing_page():
                     if selected_author != "선택안함" and target_author_name:
                         clean_selected_author = selected_author.strip()
                         mask = df_a_to_save['AUTHOR'].astype(str).str.strip() == clean_selected_author
-                        
-                        # 기본 이름은 u_info에서 온 이름으로 설정
                         df_a_to_save.loc[mask, '이름'] = str(target_author_name)
                         
-                        # matches_for_id = search_users_by_name(target_author_name)
-                        # target_user_id = None
-                        # if matches_for_id:
-                        #     target_user_id = matches_for_id[0]['id']
-                        #     for user in matches_for_id:
-                        #         eng_names = [user.get(f'hname{i}') for i in range(1, 5) if user.get(f'hname{i}')]
-                        #         if clean_selected_author in eng_names:
-                        #             target_user_id = user['id']
-                        # #             break
-                        # if target_user_id:
-                        #     df_a_to_save.loc[mask, '직원번호'] = str(target_user_id)
                         target_user_id_to_save = None
                         if target_id_from_upload and target_id_from_upload.strip():
                             chosen_user = st.session_state.get('receipt_chosen_user')
 
                         if chosen_user:
-                            # 동명이인 처리 등에서 선택된 직원이 있으면 그 정보를 우선 사용
                             target_user_id_to_save = chosen_user['id']
-                            # 이름도 HR DB에 있는 정확한 이름으로 업데이트
                             df_a_to_save.loc[mask, '이름'] = str(chosen_user['name'])
                         elif target_id_from_upload and target_id_from_upload.strip():
-                            # 비회원 업로드 시 입력한 직원번호가 있으면 차선으로 사용
                             target_user_id_to_save = target_id_from_upload
                         else:
                             matches_for_id = search_users_by_name(target_author_name)
@@ -3897,7 +4273,6 @@ def show_receipt_processing_page():
                         conn.close()
                     except Exception as e: print(f"Column check error: {e}")
 
-                    # [수정] user_id 전달하여 이력 관리 (접수처리는 관리자만 하므로 'AD00000' 혹은 현재 로그인 유저)
                     c_saved = update_or_add_paper_data(df_c_transposed, "c_info", key_cols, user_id=st.session_state.username)
                     a_saved = update_or_add_paper_data(df_a_to_save, "a_info", key_cols, user_id=st.session_state.username)
                     
@@ -3905,34 +4280,27 @@ def show_receipt_processing_page():
                         try:
                             conn = sqlite3.connect(DB_FILE)
                             cur = conn.cursor()
-                            # -------------------------------------------------------------
-                            # [추가] 변경 신청 처리 완료 시, 구버전 파일 정리
-                            # -------------------------------------------------------------
-                            cur.execute("SELECT OLD_FILE_NAME FROM u_info WHERE PDF_FILE_NAME = ?", (st.session_state.receipt_target_pdf,))
+                            cur.execute("SELECT OLD_FILE_NAME FROM u_info WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
                             row = cur.fetchone()
                             if row and row[0]:
                                 old_pdf = row[0]
-                                # 해시 중복이 아닌, 새로운 파일로 교체된 경우 구버전 파일/DB 삭제
-                                if old_pdf != st.session_state.receipt_target_pdf:
+                                if old_pdf != pdf_to_handle:
                                     cur.execute("DELETE FROM c_info WHERE PDF_FILE_NAME = ?", (old_pdf,))
                                     cur.execute("DELETE FROM a_info WHERE PDF_FILE_NAME = ?", (old_pdf,))
                                     delete_paper_files(old_pdf)
-                            # -------------------------------------------------------------                            
-                            cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (st.session_state.receipt_target_pdf,))
+                                                        
+                            cur.execute("UPDATE u_info SET DONE = 1 WHERE PDF_FILE_NAME = ?", (pdf_to_handle,))
                             conn.commit()
                             
-                            # [수정] 다중/단일 모드에 따라 다음 동작 결정
                             if st.session_state.get("receipt_multi_mode"):
                                 st.session_state.receipt_multi_current_index += 1
-                                # 다음 아이템을 위해 분석 상태 초기화
                                 st.session_state.receipt_analysis_done = False
                                 st.session_state.receipt_target_pdf = None
-                                st.session_state.receipt_target_old_pdf = None # [추가]
+                                st.session_state.receipt_target_old_pdf = None 
                                 st.session_state.receipt_editing = False
                                 if 'receipt_success_msg' in st.session_state: del st.session_state.receipt_success_msg
                                 st.rerun()
                             else:
-                                # 기존 단일 모드 완료 로직
                                 st.session_state.receipt_success_msg = "저장 및 처리완료 되었습니다."
                                 st.session_state.receipt_c_info_original = edited_c.copy()
                                 st.session_state.receipt_a_info_original = df_a_to_save.copy()
@@ -3942,7 +4310,7 @@ def show_receipt_processing_page():
                         except Exception as e: st.error(f"오류: {e}")
 
             with col_cancel:
-                if st.button("취소"):
+                if st.button("취소", key="cancel_receipt_btn"):
                     st.session_state.receipt_c_info = st.session_state.receipt_c_info_original.copy()
                     st.session_state.receipt_a_info = st.session_state.receipt_a_info_original.copy()
                     st.session_state.receipt_editing = False
@@ -3953,7 +4321,10 @@ def show_receipt_processing_page():
             doi_value = st.session_state.receipt_c_info.loc[st.session_state.receipt_c_info["Key"] == "DOI", "Value"]
             if not doi_value.empty:
                 st.link_button("🔗 DOI URL", url=doi_value.iloc[0])
-            st.dataframe(st.session_state.receipt_a_info[["ROLE", "AUTHOR", "AFFILIATION", "이름"]], use_container_width=True)
+            
+            view_cols = ["ROLE", "AUTHOR", "AFFILIATION", "직원번호", "이름", "소속", "부서"]
+            available_view_cols = [c for c in view_cols if c in st.session_state.receipt_a_info.columns]
+            st.dataframe(st.session_state.receipt_a_info[available_view_cols], use_container_width=True)
             
             col_edit, col_close = st.columns([0.5, 0.5])
             with col_edit:
@@ -3961,16 +4332,15 @@ def show_receipt_processing_page():
                     st.session_state.receipt_editing = True
                     st.rerun()
             with col_close:
-                if st.button("닫기 (분석 종료)"):
+                if st.button("닫기 (분석 종료)", key="receipt_close_btn"):
                     st.session_state.receipt_analysis_done = False
                     st.session_state.receipt_target_pdf = None
-                    st.session_state.receipt_target_old_pdf = None # [추가]
+                    st.session_state.receipt_target_old_pdf = None 
                     st.rerun()
 
     if st.session_state.get("receipt_success_msg"):
         st.success(st.session_state.receipt_success_msg)
         del st.session_state["receipt_success_msg"]
-
 
 def main():
     if "logged_in" not in st.session_state: st.session_state.logged_in = False
@@ -4008,5 +4378,5 @@ def main():
         show_login_page()
 
 if __name__ == "__main__":
-    version = "1.0.5"
+    version = "1.0.8"
     main()
