@@ -1,7 +1,20 @@
 # paper-collector 논문수집기
 paper-collector (논문수집기)
 
-(260607) 1.0.8 논문 확정 기능 및 활동 로그 추가, 삭제 처리 버그 수정
+(260703) 1.0.10 ISSN, IF 추출 추가 및 NO 가 있으면 로그 남기기
+1) DB 스키마 추가
+   - c_info 테이블에 issn_print / issn_electronic 컬럼 추가 
+   - c_info 테이블에 is_scie, is_scopus, is_kci, impact 컬럼 추가 
+   - pdf 처리시 ISSN, IF 도 처리하기
+   - ISSN 일괄등록
+   - IF 연도별 일괄등록
+2) PDF 등록시 NO 가 있으면 로그 남기기
+   - pdf  읽어서 파싱하고, LLM에 문의 결과에 "NO_TEXT", "ERROR", NO로 시작하는 게 있으면 해당컬럼과 값을 로그파일에 저장
+3) 논문검색 에서 검색조건으로 파일이름  추가
+4) '참여','저자구분' 컬럼에 보여주기 & 검색기능 추가
+   - 발행년도,부서명, 저널명 : 다중 선택
+
+(260607) 1.0.9 논문 확정 기능 및 활동 로그 추가, 삭제 처리 버그 수정
 1) DB 스키마 추가
    - a_info 테이블에 CONFIRM_STATUS / CONFIRM_DT / CONFIRM_ID 컬럼 추가 (UNCONFIRMED / USER_CLAIMED / ADMIN_CONFIRMED)
    - activity_log 테이블 신규 생성 (ACTION_DT, ACTION_TYPE, ACTOR_ID, TARGET_TABLE, TARGET_KEY, OLD_VALUE, NEW_VALUE, MEMO)

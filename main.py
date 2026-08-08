@@ -3,6 +3,7 @@ import streamlit as st
 import hashlib
 import datetime
 import os
+import io
 import sqlite3
 import bcrypt
 import json
@@ -25,6 +26,7 @@ from dotenv import load_dotenv
 DB_FILE = "paper.db"
 upload_folder = "uploaded"
 resolve_folder = "resolved"
+log_folder = "log"  # <--- [추가] 로그 저장 폴더
 
 load_dotenv(override=True)  # modify
 PDF_SERVICE_URL = os.getenv("PDF_SERVICE_URL")
@@ -32,6 +34,19 @@ if not PDF_SERVICE_URL:
     raise ValueError("❌🔑❌ 'PDF_SERVICE_URL'가 .env 파일에 없습니다.")
 # [추가] PDF_SERVICE_URL2 환경변수 로드 (없어도 예외를 발생시키진 않음)
 PDF_SERVICE_URL2 = os.getenv("PDF_SERVICE_URL2")
+ISSN_SERVICE_URL = os.getenv("ISSN_SERVICE_URL")
+if not ISSN_SERVICE_URL:
+    raise ValueError("❌🔑❌ 'ISSN_SERVICE_URL'가 .env 파일에 없습니다.")
+# [추가] ISSN_SERVICE_URL2 환경변수 로드 (없어도 예외를 발생시키진 않음)
+ISSN_SERVICE_URL2 = os.getenv("ISSN_SERVICE_URL2")
+# -------------------------------------------------------------
+# 👇 여기에 아래 IMPACT 코드를 추가하세요
+# -------------------------------------------------------------
+IMPACT_SERVICE_URL = os.getenv("IMPACT_SERVICE_URL")
+if not IMPACT_SERVICE_URL:
+    raise ValueError("❌🔑❌ 'IMPACT_SERVICE_URL'가 .env 파일에 없습니다.")
+IMPACT_SERVICE_URL2 = os.getenv("IMPACT_SERVICE_URL2")
+# -------------------------------------------------------------
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT"))
 if not REQUEST_TIMEOUT:
     raise ValueError("❌🔑❌ 'REQUEST_TIMEOUT'가 .env 파일에 없습니다.")
@@ -282,9 +297,9 @@ def init_db():
     """
     )
     c.execute("PRAGMA table_info(user_info)")
-    columns = [col[1] for col in c.fetchall()]
+    c_info_cols = [col[1] for col in c.fetchall()]
     for i in range(1, 5):
-        if f"hname{i}" not in columns:
+        if f"hname{i}" not in c_info_cols:
             c.execute(f"ALTER TABLE user_info ADD COLUMN hname{i} TEXT")
 
     # 2. 비로그인 업로드용 u_info 테이블 생성
@@ -338,6 +353,16 @@ def init_db():
             "DOI" TEXT
         )
     """)
+    # -------------------------------------------------------------
+    # 👇 여기에 c_info 컬럼 검사 및 자동 추가 코드를 덮어쓰거나 추가하세요
+    # -------------------------------------------------------------
+    c.execute("PRAGMA table_info(c_info)")
+    c_info_cols_exist = [col[1] for col in c.fetchall()]
+    new_c_info_cols = ["issn_print", "issn_electronic", "is_scie", "is_scopus", "is_kci", "IMPACT"]
+    for new_col in new_c_info_cols:
+        if new_col not in c_info_cols_exist:
+            c.execute(f"ALTER TABLE c_info ADD COLUMN {new_col} TEXT")
+    # -------------------------------------------------------------    
 
     # 5. a_info 테이블 생성 (없으면)
     c.execute("""
@@ -989,7 +1014,9 @@ def get_activity_log(action_type=None, actor_id=None, target_key=None,
     finally:
         conn.close()
 
-
+# -------------------------------------------------------------------------
+# [수정] 나의 논문 조회 (다중 역할 쉼표 표기 및 중복 제거 적용)
+# -------------------------------------------------------------------------
 def get_my_papers(user_name, user_id):
     """
     a_info의 '이름'이 user_name과 일치하는 행을 찾고,
@@ -1003,19 +1030,24 @@ def get_my_papers(user_name, user_id):
         if not cursor.fetchone():
             return pd.DataFrame()
 
-        # [핵심 로직]
-        # 1. a_info(a)와 c_info(c)를 PDF_FILE_NAME으로 조인
-        # 2. 조건: a.이름 = 로그인한 사용자 이름 AND a.직원번호 = 아이디
+        # [수정] GROUP_CONCAT을 사용하여 동일 논문 내의 다중 역할을 합침
         query = """
-            SELECT c.*, a.AUTHOR, a.ROLE, a.AFFILIATION, a.이름, a.CONFIRM_STATUS
+            SELECT c.*, a.AUTHOR, GROUP_CONCAT(a.ROLE, ', ') as ROLE, a.AFFILIATION, a.이름, a.CONFIRM_STATUS
             FROM a_info a
             JOIN c_info c ON a.PDF_FILE_NAME = c.PDF_FILE_NAME
             WHERE a.이름 = ?
                 AND a.직원번호 = ?
-            ORDER BY c.PUBLICATION_YEAR, c.TITLE, a.AUTHOR, a.ROLE
+            GROUP BY c.PDF_FILE_NAME
+            ORDER BY c.PUBLICATION_YEAR DESC, c.TITLE
         """
 
         df = pd.read_sql_query(query, conn, params=(user_name, user_id,))
+        
+        # [추가] 다중 역할 중복 제거 (예: "CO_AUTHOR, CO_AUTHOR" -> "CO_AUTHOR")
+        if not df.empty and 'ROLE' in df.columns:
+            df['ROLE'] = df['ROLE'].apply(
+                lambda x: ', '.join(sorted(set([r.strip() for r in str(x).split(', ') if r.strip()]))) if pd.notna(x) else ""
+            )
 
         # 중복된 컬럼(PDF_FILE_NAME 등)이 있을 경우 제거
         df = df.loc[:, ~df.columns.duplicated()]
@@ -1023,7 +1055,6 @@ def get_my_papers(user_name, user_id):
                  'TITLE', 'PUBLICATION_YEAR', 'JOURNAL_NAME', 'FIRST_AUTHOR',
                  'CORRESPONDING_AUTHOR', 'AUTHOR_LIST', 'VOLUME', 'ISSUE', 'PAGE', 'DOI',
                  'ORI_FILE_NAME', 'PDF_FILE_NAME']]
-        df = df.drop_duplicates(subset='TITLE', keep='first')
         return df
     except Exception as e:
         st.error(f"내 논문 조회 중 오류 발생: {e}")
@@ -1500,6 +1531,52 @@ def get_active_pdf_service_url():
             
     return None
 
+# -------------------------------------------------------------------------
+# [추가] 사용 가능한 PDF 서비스 URL 확인 및 자동 전환 함수
+# -------------------------------------------------------------------------
+def get_active_issn_service_url():
+    """
+    메인 서버(ISSN_SERVICE_URL) 접속을 먼저 시도하고, 실패 시 백업 서버(ISSN_SERVICE_URL2)를 시도합니다.
+    접속 가능한 URL을 반환하며, 둘 다 실패하면 None을 반환합니다.
+    """
+    urls_to_try = [ISSN_SERVICE_URL]
+    if ISSN_SERVICE_URL2:
+        urls_to_try.append(ISSN_SERVICE_URL2)
+        
+    for url in urls_to_try:
+        if not url: continue
+        try:
+            # 타임아웃 3초로 단순 연결 테스트 (응답이 오면 살아있는 서버로 간주)
+            requests.get(url, timeout=3)
+            # print('[INFO] ISSN 서비스 연결 성공:', url)
+            return url
+        except requests.RequestException:
+            # 연결 실패 시 다음 URL 시도
+            continue
+            
+    return None
+
+# -------------------------------------------------------------------------
+# [추가] 사용 가능한 IMPACT 서비스 URL 확인 및 자동 전환 함수
+# -------------------------------------------------------------------------
+def get_active_impact_service_url():
+    """
+    메인 서버(IMPACT_SERVICE_URL) 접속을 먼저 시도하고, 실패 시 백업 서버(IMPACT_SERVICE_URL2)를 시도합니다.
+    """
+    urls_to_try = [IMPACT_SERVICE_URL]
+    if IMPACT_SERVICE_URL2:
+        urls_to_try.append(IMPACT_SERVICE_URL2)
+        
+    for url in urls_to_try:
+        if not url: continue
+        try:
+            requests.get(url, timeout=3)
+            return url
+        except requests.RequestException:
+            continue
+            
+    return None
+
 # 3. 해시 계산 함수 (SHA-256)
 def calculate_hash(file_bytes):
     sha256_hash = hashlib.sha256()
@@ -1592,6 +1669,20 @@ def normalize_title(title):
     if pd.isna(title) or not title:
         return ""
     return re.sub(r'[^a-zA-Z0-9가-힣]', '', str(title).lower())
+
+# -------------------------------------------------------------------------
+# [추가] 파일명 검색용 정규화 함수
+# -------------------------------------------------------------------------
+def normalize_filename_for_search(fname):
+    """
+    파일명에서 .pdf 확장자를 제거하고, 영문/숫자/한글이 아닌 모든 문자를 제거한 후 소문자로 변환합니다.
+    """
+    if pd.isna(fname) or not str(fname).strip():
+        return ""
+    s = str(fname).lower().strip()
+    if s.endswith('.pdf'):
+        s = s[:-4]
+    return re.sub(r'[^a-z0-9가-힣]', '', s)
 
 # -------------------------------------------------------------------------
 # [추가] 정규화된 TITLE을 기준으로 중복 논문을 찾는 함수
@@ -1696,7 +1787,360 @@ def check_file_discrepancies():
         "db_missing_resolved": sorted(list(db_missing_resolved)),
         "orphan_resolved": sorted(list(orphan_resolved))
     }
+# -------------------------------------------------------------------------
+# [추가] 추출 결과 검증(NO_TEXT/ERROR 로그) 및 ISSN 자동 조회 함수
+# -------------------------------------------------------------------------
+# def process_and_log_missing_and_issn(pdf_file_name, c_info_df):
+#     """
+#     1. c_info_df의 Value 중 "NO_TEXT"나 "ERROR"가 포함되거나 "NO"로 시작하는 컬럼을 찾습니다.
+#     2. DOI 또는 (TITLE, JOURNAL_NAME, PUBLICATION_YEAR)를 이용해 로컬 ISSN API를 호출합니다.
+#     3. ISSN API 결과의 confidence가 high/medium이면 c_info_df에 추가하고,
+#        그렇지 않으면 로그에 "issn : NO_ISSN"를 기록합니다.
+#     4. 수집된 로그가 있다면 /log 폴더에 pdf파일명.log 로 저장합니다.
+#     """
+#     import requests
 
+#     if not os.path.exists(log_folder):
+#         os.makedirs(log_folder)
+
+#     missing_logs = []
+
+#     # 1. NO_TEXT, ERROR, 및 "NO"로 시작하는 항목 검사
+#     for _, row in c_info_df.iterrows():
+#         val = str(row['Value']).strip()
+#         # 대문자 NO로 시작(NO DATE LIST, NO DOI 등)하거나 ERROR가 포함된 경우를 모두 잡아냅니다.
+#         if val.startswith("NO") or "ERROR" in val:
+#             missing_logs.append(f"{row['Key']} : {val}")
+
+#     # 2. ISSN 조회에 필요한 파라미터 추출
+#     def get_val(key):
+#         res = c_info_df.loc[c_info_df['Key'] == key, 'Value']
+#         if not res.empty:
+#             val = str(res.iloc[0]).strip()
+#             # 빈 값, 에러 문자열 등은 파라미터에서 제외
+#             if val not in ["", "None", "nan", "NO_TEXT", "ERROR", "NO DATE LIST", "NO ABSTRACT", "NO KEYWORD LIST"]:
+#                 return val
+#         return None
+
+#     doi = get_val("DOI")
+#     title = get_val("TITLE")
+#     journal = get_val("JOURNAL_NAME")
+#     year = get_val("PUBLICATION_YEAR")
+
+#     params = {}
+#     if doi:
+#         params['doi'] = doi
+#     else:
+#         if title: params['title'] = title
+#         if journal: params['journal'] = journal
+#         if year: params['year'] = year
+
+#     issn_print = None
+#     issn_electronic = None
+#     issn_confidence = "low"
+
+#     # 3. 파라미터가 1개라도 있으면 ISSN API 호출
+#     if params:
+#         try:
+#             # 로컬 ISSN API 호출
+#             active_url = get_active_issn_service_url()
+
+#             if not active_url:
+#                 st.error("🚨 **ISSN 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
+#             else:
+#                 with st.spinner(f"ISSN 검색 중... (연결된 서버: {active_url.split('//')[1].split(':')[0]})"):
+#                     resp = requests.get(active_url+"/issn", params=params, timeout=10)
+#                     if resp.status_code == 200:
+#                         data = resp.json()
+#                         issn_confidence = str(data.get("confidence", "")).lower()
+#                         # confidence가 high, medium일 때만 값 가져오기
+#                         if issn_confidence in ["high", "medium"]:
+#                             issn_print = data.get("issn_print")
+#                             issn_electronic = data.get("issn_electronic")
+#         except Exception as e:
+#             print(f"ISSN API 호출 오류: {e}")
+
+#     # 4. 결과(ISSN)를 c_info_df에 반영 또는 로그 추가
+#     new_rows = []
+    
+#     # [수정된 부분 시작] 결과가 있든 없든 항상 Key를 생성하고, 값이 없으면 빈 문자열을 넣습니다.
+#     val_print = issn_print if issn_print else ""
+#     val_electronic = issn_electronic if issn_electronic else ""
+    
+#     new_rows.append({"Key": "issn_print", "Value": val_print})
+#     new_rows.append({"Key": "issn_electronic", "Value": val_electronic})
+
+#     # 둘 다 못 찾은 경우 로그 추가 처리는 그대로 유지
+#     if not issn_print and not issn_electronic:
+#         missing_logs.append("issn : NO_ISSN")
+#     # [수정된 부분 끝]
+
+#     if new_rows:
+#         c_info_df = pd.concat([c_info_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+#     # 5. 추출된 에러 로그가 하나라도 있으면 파일(.log)로 저장
+#     if missing_logs:
+#         log_filename = os.path.splitext(pdf_file_name)[0] + ".log"
+#         log_path = os.path.join(log_folder, log_filename)
+#         with open(log_path, "w", encoding="utf-8") as f:
+#             f.write("\n".join(missing_logs))
+
+#     return c_info_df
+
+# -------------------------------------------------------------------------
+# [수정] 추출 결과 검증(NO_TEXT/ERROR 로그) 및 ISSN/IMPACT FACTOR 자동 조회 함수
+# -------------------------------------------------------------------------
+def process_and_log_missing_and_issn(pdf_file_name, c_info_df):
+    """
+    1. c_info_df의 Value 중 "NO_TEXT"나 "ERROR"가 포함되거나 "NO"로 시작하는 컬럼을 찾습니다.
+    2. DOI 또는 (TITLE, JOURNAL_NAME, PUBLICATION_YEAR)를 이용해 로컬 ISSN API를 호출합니다.
+    3. ISSN API 결과에 따라 issn_print, issn_electronic 값을 c_info_df에 추가합니다.
+    4. 확보한 저널명, 발행년도, ISSN을 바탕으로 IMPACT FACTOR API를 호출하여 분석 결과를 병합합니다.
+    5. 수집된 로그가 있다면 /log 폴더에 pdf파일명.log 로 저장합니다.
+    """
+    import requests
+    import re
+
+    if not os.path.exists(log_folder):
+        os.makedirs(log_folder)
+
+    missing_logs = []
+
+    # 1. NO_TEXT, ERROR, 및 "NO"로 시작하는 항목 검사
+    for _, row in c_info_df.iterrows():
+        val = str(row['Value']).strip()
+        if val.startswith("NO") or "ERROR" in val:
+            missing_logs.append(f"{row['Key']} : {val}")
+
+    # 2. 파라미터 추출
+    def get_val(key):
+        res = c_info_df.loc[c_info_df['Key'] == key, 'Value']
+        if not res.empty:
+            val = str(res.iloc[0]).strip()
+            if val not in ["", "None", "nan", "NO_TEXT", "ERROR", "NO DATE LIST", "NO ABSTRACT", "NO KEYWORD LIST"]:
+                return val
+        return None
+
+    doi = get_val("DOI")
+    title = get_val("TITLE")
+    journal = get_val("JOURNAL_NAME")
+    year = get_val("PUBLICATION_YEAR")
+
+    params = {}
+    if doi:
+        params['doi'] = doi
+    else:
+        if title: params['title'] = title
+        if journal: params['journal'] = journal
+        if year: params['year'] = year
+
+    issn_print = None
+    issn_electronic = None
+    issn_confidence = "low"
+
+    # 3. ISSN API 호출
+    if params:
+        try:
+            active_url = get_active_issn_service_url()
+            if not active_url:
+                import streamlit as st
+                st.error("🚨 **ISSN 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
+            else:
+                import streamlit as st
+                with st.spinner(f"ISSN 검색 중... (연결된 서버: {active_url.split(':')[0]})"):
+                    resp = requests.get(active_url+"/issn", params=params, timeout=10)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        issn_confidence = str(data.get("confidence", "")).lower()
+                        if issn_confidence in ["high", "medium"]:
+                            issn_print = data.get("issn_print")
+                            issn_electronic = data.get("issn_electronic")
+        except Exception as e:
+            print(f"ISSN API 호출 오류: {e}")
+
+    # 결과(ISSN)를 배열에 반영 
+    new_rows = []
+    val_print = issn_print if issn_print else ""
+    val_electronic = issn_electronic if issn_electronic else ""
+    
+    new_rows.append({"Key": "issn_print", "Value": val_print})
+    new_rows.append({"Key": "issn_electronic", "Value": val_electronic})
+
+    if not issn_print and not issn_electronic:
+        missing_logs.append("issn : NO_ISSN")
+
+    # -------------------------------------------------------------------------
+    # [수정] 4. IMPACT FACTOR 환경변수 URL을 통한 조회 로직
+    # -------------------------------------------------------------------------
+    is_scie, is_scopus, is_kci = False, False, False
+    max_impact = None
+
+    if journal and year:
+        try:
+            # 안전한 발행년도 파싱 (정규식을 통해 4자리 숫자 추출)
+            pub_year_match = re.search(r'\d{4}', str(year))
+            if pub_year_match:
+                pub_year_int = int(pub_year_match.group())
+                
+                impact_params = {
+                    'journal_name': journal,
+                    'pub_year': pub_year_int
+                }
+                if val_print: impact_params['issn'] = val_print
+                if val_electronic: impact_params['eissn'] = val_electronic
+                    
+                # [수정] 하드코딩 URL 제거 및 환경변수 함수 활용
+                active_impact_url = get_active_impact_service_url()
+                
+                if not active_impact_url:
+                    import streamlit as st
+                    st.error("🚨 **IMPACT 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
+                    missing_logs.append("IMPACT API ERROR: No Active Server")
+                else:
+                    impact_url_endpoint = f"{active_impact_url}/api/match"
+                    
+                    import streamlit as st
+                    with st.spinner(f"IMPACT FACTOR 분석 중... (연결된 서버: {active_impact_url.split(':')[0]})"):
+                        resp_impact = requests.get(impact_url_endpoint, params=impact_params, headers={'accept': 'application/json'}, timeout=15)
+                    
+                    if resp_impact.status_code == 200:
+                        impact_data = resp_impact.json()
+                        journal_data = impact_data.get("journal_data", [])
+                        
+                        valid_jd = []
+                        for jd in journal_data:
+                            base_year = jd.get("base_year")
+                            if base_year and pub_year_int < int(base_year):
+                                continue
+                            valid_jd.append(jd)
+                        
+                        # 각 카테고리별 로그 기록 및 최대 IMPACT 산출
+                        for jd in valid_jd:
+                            flags = jd.get("flags", {})
+                            if flags.get("is_scie"): is_scie = True
+                            if flags.get("is_scopus"): is_scopus = True
+                            if flags.get("is_kci"): is_kci = True
+                            
+                            cat_name = "Unknown Category"
+                            if_val_str = "N/A"
+                            
+                            if flags.get("is_scie"):
+                                jcr = jd.get("jcr", {})
+                                if jcr:
+                                    cat_name = jcr.get("category", cat_name)
+                                    if_jcr_val = jcr.get("if_jcr")
+                                    if if_jcr_val is not None:
+                                        if_val_str = str(if_jcr_val)
+                                        try:
+                                            if_val_float = float(if_jcr_val)
+                                            if max_impact is None or if_val_float > max_impact:
+                                                max_impact = if_val_float
+                                        except ValueError:
+                                            pass
+                                            
+                            # 각 카테고리별로 로그를 남김
+                            missing_logs.append(f"Category: {cat_name}, IF: {if_val_str}")
+                        
+        except Exception as e:
+            print(f"IMPACT FACTOR API 조회 오류: {e}")
+            missing_logs.append(f"IMPACT API ERROR: {e}")
+
+    # 최종 결과 로그 기록
+    missing_logs.append(f"is_scie : {'TRUE' if is_scie else 'FALSE'}")
+    missing_logs.append(f"is_scopus : {'TRUE' if is_scopus else 'FALSE'}")
+    missing_logs.append(f"is_kci : {'TRUE' if is_kci else 'FALSE'}")
+    missing_logs.append(f"impact : {max_impact if max_impact is not None else 'NO_IMPACT'}")
+
+    # [수정] DB(c_info) 기록용 컬럼 추가. c_info_df 가 변환(전치)되어 저장될 때 DB에 자동으로 매핑됩니다.
+    new_rows.append({"Key": "is_scie", "Value": "true" if is_scie else "false"})
+    new_rows.append({"Key": "is_scopus", "Value": "true" if is_scopus else "false"})
+    new_rows.append({"Key": "is_kci", "Value": "true" if is_kci else "false"})
+    
+    impact_value = str(max_impact) if (is_scie and max_impact is not None) else ""
+    new_rows.append({"Key": "IMPACT", "Value": impact_value})
+    # -------------------------------------------------------------------------
+
+    if new_rows:
+        c_info_df = pd.concat([c_info_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    if missing_logs:
+        log_filename = os.path.splitext(pdf_file_name)[0] + ".log"
+        log_path = os.path.join(log_folder, log_filename)
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(missing_logs))
+
+    return c_info_df
+# -------------------------------------------------------------------------
+# [추가] ISSN 정보 일괄 업데이트 함수
+# -------------------------------------------------------------------------
+def update_issn_from_csv():
+    """
+    data/issn_final_result.csv 파일을 읽어 c_info 테이블의 TITLE과 비교 후,
+    issn_print, issn_electronic 값을 업데이트합니다.
+    """
+    csv_path = os.path.join("data", "issn_final_result.csv")
+    if not os.path.exists(csv_path):
+        return False, f"파일을 찾을 수 없습니다: {csv_path}"
+        
+    try:
+        df_csv = pd.read_csv(csv_path)
+        
+        # 컬럼명 소문자 변환 (대소문자 차이로 인한 에러 방지)
+        df_csv.columns = [str(col).strip().lower() for col in df_csv.columns]
+        if 'title' not in df_csv.columns or 'issn_print' not in df_csv.columns or 'issn_electronic' not in df_csv.columns:
+            return False, "CSV 파일에 필수 컬럼('title', 'issn_print', 'issn_electronic')이 없습니다."
+            
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # 1. c_info 테이블에 issn 컬럼이 없다면 자동 추가
+        cursor.execute("PRAGMA table_info(c_info)")
+        cols = [info[1] for info in cursor.fetchall()]
+        if "issn_print" not in cols:
+            cursor.execute("ALTER TABLE c_info ADD COLUMN issn_print TEXT")
+        if "issn_electronic" not in cols:
+            cursor.execute("ALTER TABLE c_info ADD COLUMN issn_electronic TEXT")
+        
+        # 2. 기존 c_info 데이터 가져와서 정규화된 TITLE 매핑용 데이터 생성
+        # (단순 비교 시 띄어쓰기, 대소문자 차이로 누락되는 것을 막기 위해 normalize_title 재사용)
+        c_info_df = pd.read_sql_query("SELECT PDF_FILE_NAME, TITLE FROM c_info", conn)
+        c_info_df['NORM_TITLE'] = c_info_df['TITLE'].apply(normalize_title)
+        
+        update_data = []
+        
+        # 3. CSV 순회하며 매칭되는 논문 찾기
+        for _, row in df_csv.iterrows():
+            csv_title = str(row.get('title', ''))
+            norm_csv = normalize_title(csv_title)
+            
+            # 빈 값이거나 pandas의 nan인 경우 처리
+            issn_p = str(row.get('issn_print', '')).strip()
+            if issn_p.lower() == 'nan': issn_p = ""
+            
+            issn_e = str(row.get('issn_electronic', '')).strip()
+            if issn_e.lower() == 'nan': issn_e = ""
+            
+            if norm_csv and (issn_p or issn_e):
+                # 정규화된 제목이 일치하는 모든 논문 찾기
+                matched_pdfs = c_info_df[c_info_df['NORM_TITLE'] == norm_csv]['PDF_FILE_NAME'].tolist()
+                for pdf in matched_pdfs:
+                    # UPDATE문에 들어갈 튜플 (issn_print, issn_electronic, PDF_FILE_NAME)
+                    update_data.append((issn_p, issn_e, pdf))
+                    
+        # 4. DB 일괄 업데이트 수행
+        if update_data:
+            cursor.executemany(
+                "UPDATE c_info SET issn_print = ?, issn_electronic = ? WHERE PDF_FILE_NAME = ?", 
+                update_data
+            )
+            conn.commit()
+            
+        conn.close()
+        return True, f"총 {len(update_data)}건의 논문에 ISSN 정보가 성공적으로 업데이트되었습니다."
+        
+    except Exception as e:
+        return False, f"업데이트 중 오류 발생: {str(e)}"
+    
 # -------------------------------------------------------------------------
 # [추가] 3. 논문 제목 중복 확인 함수
 # -------------------------------------------------------------------------
@@ -2041,7 +2485,7 @@ def show_main_app_page():
             if not active_url:
                 st.error("🚨 **PDF 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
             else:
-                with st.spinner(f"PDF 분석 중... (연결된 서버: {active_url})"):
+                with st.spinner(f"PDF 분석 중... (연결된 서버: {active_url.split('//')[1].split(':')[0]})"):
                     json_data, error = get_pdf_json(file_path, active_url, REQUEST_TIMEOUT)
             st.session_state.last_uploaded_pdf_path = file_path
 
@@ -2085,7 +2529,9 @@ def show_main_app_page():
                     # c_info = pd.concat([c_info.drop(15, errors="ignore"), new_rows], ignore_index=True)
                     # concat 후 Key 컬럼 기준으로 중복된 행을 제거 (나중에 추가된 정보를 우선함)
                     c_info = pd.concat([c_info, new_rows], ignore_index=True).drop_duplicates(subset=['Key'], keep='last')
-                    
+                    # --- [추가] 누락 정보(NO_TEXT 등) 로깅 및 ISSN API 연동 수행 ---
+                    c_info = process_and_log_missing_and_issn(pdf_name, c_info)
+                    # -------------------------------------------------------------
                     a_info["ORI_FILE_NAME"] = ori_pdf_name
                     a_info["PDF_FILE_NAME"] = pdf_name
                     a_info["JSON_FILE_NAME"] = json_name
@@ -2844,9 +3290,12 @@ def show_my_papers_page():
     # 필터 상태 초기화
     if "search_filters" not in st.session_state:
         st.session_state.search_filters = {
-            "title": "", "author": "", "year": "전체", "dept": "전체", "journal": "전체", "applied": False
+            "title": "", "author": "", "year": "전체", "dept": "전체", "journal": "전체","filename": "", "roles": [], "author_categories": [],"applied": False
         }
-    
+    # [추가] 검색 조건 초기화 버튼 클릭 시 폼 UI의 캐시를 완벽히 날리기 위한 키
+    if "search_form_key" not in st.session_state:
+        st.session_state.search_form_key = 0    
+
     # [상태 변수] PDF 변경 모드
     if "change_pdf_mode" not in st.session_state:
         st.session_state.change_pdf_mode = False
@@ -2887,42 +3336,71 @@ def show_my_papers_page():
 
         with st.container(border=True):
             st.markdown("#### 🔍 논문 검색")
-            with st.form(key="search_form"):
+            # [수정] 폼의 key를 동적으로 할당하여 초기화 시 UI 캐시가 100% 증발되도록 처리
+            with st.form(key=f"search_form_{st.session_state.search_form_key}"):
+                def get_safe_defaults(key_name, options_list):
+                    val = st.session_state.search_filters.get(key_name, [])
+                    if not isinstance(val, list):
+                        return []
+                    return [x for x in val if x in options_list]
+
                 if is_admin:
                     col1, col2, col3 = st.columns([1.5, 1, 1])
                     with col1:
-                        search_title = st.text_input("논문명 (포함 검색)", value=st.session_state.search_filters["title"])
+                        search_title = st.text_input("논문명 (포함 검색)", value=st.session_state.search_filters.get("title", ""))
                     with col2:
-                        search_author = st.text_input("저자명", value=st.session_state.search_filters["author"])
+                        search_author = st.text_input("저자명 (검색 필수)", value=st.session_state.search_filters.get("author", ""))
                     with col3:
-                        curr_yr = st.session_state.search_filters["year"]
-                        idx_yr = years.index(curr_yr) if curr_yr in years else 0
-                        search_year = st.selectbox("발행년도", years, index=idx_yr)
+                        search_year = st.multiselect("발행년도", filter_opts["years"], default=get_safe_defaults("year", filter_opts["years"]))
                     
-                    col4, col5 = st.columns([1, 1.5])
+                    col4, col5, col6 = st.columns([1, 1.5, 1.5])
                     with col4:
-                        curr_dept = st.session_state.search_filters["dept"]
-                        idx_dept = depts.index(curr_dept) if curr_dept in depts else 0
-                        search_dept = st.selectbox("부서 (직원정보 기준)", depts, index=idx_dept)
+                        search_dept = st.multiselect("부서 (직원정보 기준)", filter_opts["depts"], default=get_safe_defaults("dept", filter_opts["depts"]))
                     with col5:
-                        curr_jrn = st.session_state.search_filters["journal"]
-                        idx_jrn = journals.index(curr_jrn) if curr_jrn in journals else 0
-                        search_journal = st.selectbox("저널명", journals, index=idx_jrn)
+                        search_journal = st.multiselect("저널명", filter_opts["journals"], default=get_safe_defaults("journal", filter_opts["journals"]))
+                    with col6:
+                        search_filename = st.text_input("파일이름 (ORI/PDF)", value=st.session_state.search_filters.get("filename", ""))
+                        
+                    col7, col8 = st.columns([1, 1])
+                    with col7:
+                        search_roles = st.multiselect(
+                            "역할(참여) (저자명 검색 시에만 적용됨)",
+                            ["FIRST_AUTHOR", "CORRESPONDING_AUTHOR", "CO_AUTHOR"],
+                            default=get_safe_defaults("roles", ["FIRST_AUTHOR", "CORRESPONDING_AUTHOR", "CO_AUTHOR"])
+                        )
+                    with col8:
+                        search_author_categories = st.multiselect(
+                            "저자구분 (저자명 검색 시에만 적용됨)",
+                            ["단독", "주저자&교신저자", "주저자(제1저자)", "교신(책임)저자", "공동참여"],
+                            default=get_safe_defaults("author_categories", ["단독", "주저자&교신저자", "주저자(제1저자)", "교신(책임)저자", "공동참여"])
+                        )
                 else:
+                    # [수정] 일반 사용자(나의 논문) 화면에도 역할/저자구분 필터 추가
                     col1, col2, col3 = st.columns([2, 1, 1])
                     with col1:
-                        search_title = st.text_input("논문명 (포함 검색)", value=st.session_state.search_filters["title"])
+                        search_title = st.text_input("논문명 (포함 검색)", value=st.session_state.search_filters.get("title", ""))
                     with col2:
-                        curr_yr = st.session_state.search_filters["year"]
-                        idx_yr = years.index(curr_yr) if curr_yr in years else 0
-                        search_year = st.selectbox("발행년도", years, index=idx_yr)
+                        search_year = st.multiselect("발행년도", filter_opts["years"], default=get_safe_defaults("year", filter_opts["years"]))
                     with col3:
-                        curr_jrn = st.session_state.search_filters["journal"]
-                        idx_jrn = journals.index(curr_jrn) if curr_jrn in journals else 0
-                        search_journal = st.selectbox("저널명", journals, index=idx_jrn)
+                        search_journal = st.multiselect("저널명", filter_opts["journals"], default=get_safe_defaults("journal", filter_opts["journals"]))
                     
-                    search_dept = "전체"
+                    col7, col8 = st.columns([1, 1])
+                    with col7:
+                        search_roles = st.multiselect(
+                            "역할(참여)",
+                            ["FIRST_AUTHOR", "CORRESPONDING_AUTHOR", "CO_AUTHOR"],
+                            default=get_safe_defaults("roles", ["FIRST_AUTHOR", "CORRESPONDING_AUTHOR", "CO_AUTHOR"])
+                        )
+                    with col8:
+                        search_author_categories = st.multiselect(
+                            "저자구분",
+                            ["단독", "주저자&교신저자", "주저자(제1저자)", "교신(책임)저자", "공동참여"],
+                            default=get_safe_defaults("author_categories", ["단독", "주저자&교신저자", "주저자(제1저자)", "교신(책임)저자", "공동참여"])
+                        )
+
+                    search_dept = []
                     search_author = ""
+                    search_filename = "" 
 
                 st.write("") 
                 c_btn1, c_btn2 = st.columns(2)
@@ -2933,18 +3411,19 @@ def show_my_papers_page():
 
             if reset_pressed:
                 st.session_state.search_filters = {
-                    "title": "", "author": "", "year": "전체", "dept": "전체", "journal": "전체", "applied": False
+                    "title": "", "author": "", "year": [], "dept": [], "journal": [], "filename": "", 
+                    "roles": [], "author_categories": [], "applied": False
                 }
                 st.session_state.change_pdf_mode = False
                 st.session_state.admin_paper_editing = False 
+                st.session_state.search_form_key += 1  # [추가] 폼 키를 +1 올려서 폼 안의 모든 위젯(다중선택) 캐시를 강제로 파기함
                 st.rerun()
             elif search_pressed:
                 st.session_state.search_filters = {
-                    "title": search_title,
-                    "author": search_author,
-                    "year": search_year,
-                    "dept": search_dept,
-                    "journal": search_journal,
+                    "title": search_title, "author": search_author, "year": search_year,
+                    "dept": search_dept, "journal": search_journal, "filename": search_filename,
+                    "roles": search_roles, # [수정] is_admin 조건 해제 (일반 사용자도 저장)
+                    "author_categories": search_author_categories, # [수정] is_admin 조건 해제
                     "applied": True
                 }
                 st.session_state.change_pdf_mode = False
@@ -2953,24 +3432,164 @@ def show_my_papers_page():
 
         # 데이터 필터링 로직
         df_view = df_base.copy()
-        if not df_view.empty and st.session_state.search_filters["applied"]:
+        
+        # 1. 컬럼 기본 생성
+        df_view['참여'] = ""
+        df_view['저자구분'] = ""
+        
+        # 일반 사용자 (나의 논문) 모드 - 쉼표로 역할 합치고 중복 제거
+        if not is_admin and not df_view.empty and 'ROLE' in df_view.columns:
+            df_view['참여'] = df_view['ROLE'].apply(
+                lambda x: ', '.join(sorted(set([r.strip() for r in str(x).split(', ') if r.strip()]))) if pd.notna(x) else ""
+            )
+
+        # --- [수정] 참여 및 저자구분 사전 계산 (검색 여부와 무관하게 항상 계산) ---
+        if not df_view.empty:
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                pdf_list = df_view['PDF_FILE_NAME'].tolist()
+                
+                if pdf_list:
+                    placeholders = ','.join(['?'] * len(pdf_list))
+                    
+                    # 1) 관리자 모드: 검색어가 있을 때 '참여(ROLE)' 가져오기
+                    search_author = st.session_state.search_filters.get("author", "").strip() if st.session_state.search_filters.get("applied") else ""
+                    if is_admin and search_author:
+                        q_role = f"SELECT PDF_FILE_NAME, ROLE FROM a_info WHERE (AUTHOR LIKE ? OR 이름 LIKE ?) AND PDF_FILE_NAME IN ({placeholders})"
+                        role_df_raw = pd.read_sql_query(q_role, conn, params=(f"%{search_author}%", f"%{search_author}%") + tuple(pdf_list))
+                        
+                        if not role_df_raw.empty:
+                            role_agg = role_df_raw.groupby('PDF_FILE_NAME')['ROLE'].apply(
+                                lambda x: ', '.join(sorted(set([str(r).strip() for r in x if pd.notna(r) and str(r).strip()])))
+                            ).reset_index()
+                            role_agg.rename(columns={'ROLE': '참여_추출'}, inplace=True)
+                            df_view = df_view.merge(role_agg, on='PDF_FILE_NAME', how='left')
+                            df_view['참여'] = df_view['참여_추출'].fillna("")
+                            df_view = df_view.drop(columns=['참여_추출'])
+                    
+                    # 2) 단독 판단용: 논문 전체 저자 수 카운트 (관리자/일반 공통)
+                    q_cnt = f"SELECT PDF_FILE_NAME, COUNT(DISTINCT AUTHOR) as auth_cnt FROM a_info WHERE PDF_FILE_NAME IN ({placeholders}) GROUP BY PDF_FILE_NAME"
+                    cnt_df = pd.read_sql_query(q_cnt, conn, params=tuple(pdf_list))
+                    df_view = df_view.merge(cnt_df, on='PDF_FILE_NAME', how='left')
+                    df_view['auth_cnt'] = df_view.get('auth_cnt', pd.Series()).fillna(0)
+                    
+                    # 3) '저자구분' 계산 로직
+                    def get_author_category(row):
+                        role = str(row.get('참여', ''))
+                        cnt = row.get('auth_cnt', 0)
+                        if not role: return ""
+                        
+                        has_first = "FIRST_AUTHOR" in role
+                        has_corr = "CORRESPONDING_AUTHOR" in role
+                        has_co = "CO_AUTHOR" in role
+                        
+                        if has_first and has_corr:
+                            return "단독" if cnt <= 1 else "주저자&교신저자"
+                        elif has_first:
+                            return "주저자(제1저자)"
+                        elif has_corr:
+                            return "교신(책임)저자"
+                        elif has_co:
+                            return "공동참여"
+                        return ""
+                        
+                    df_view['저자구분'] = df_view.apply(get_author_category, axis=1)
+                    df_view = df_view.drop(columns=['auth_cnt'])
+                    
+                conn.close()
+            except Exception as e:
+                st.error(f"참여/저자구분 정보 조회 오류: {e}")
+
+        # 필터 적용 및 '참여', '저자구분' 계산
+        if not df_view.empty and st.session_state.search_filters.get("applied"):
             f = st.session_state.search_filters
-            if f["title"]:
-                df_view = df_view[df_view['TITLE'].str.contains(f["title"], case=False, na=False)]
-            if f["year"] != "전체":
-                df_view = df_view[df_view['PUBLICATION_YEAR'].astype(str) == f["year"]]
-            if f["journal"] != "전체":
-                df_view = df_view[df_view['JOURNAL_NAME'] == f["journal"]]
-            if is_admin and f["author"]:
+            
+            # --- [수정] 참여 및 저자구분 사전 계산 (관리자 & 일반 공통) ---
+            search_author = f.get("author", "").strip()
+            
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                pdf_list = df_view['PDF_FILE_NAME'].tolist()
+                
+                if pdf_list:
+                    placeholders = ','.join(['?'] * len(pdf_list))
+                    
+                    # 1) 관리자 모드: 검색된 저자의 '참여(ROLE)' 가져오기
+                    if is_admin and search_author:
+                        q_role = f"SELECT PDF_FILE_NAME, ROLE FROM a_info WHERE (AUTHOR LIKE ? OR 이름 LIKE ?) AND PDF_FILE_NAME IN ({placeholders})"
+                        role_df_raw = pd.read_sql_query(q_role, conn, params=(f"%{search_author}%", f"%{search_author}%") + tuple(pdf_list))
+                        
+                        if not role_df_raw.empty:
+                            role_agg = role_df_raw.groupby('PDF_FILE_NAME')['ROLE'].apply(
+                                lambda x: ', '.join(sorted(set([str(r).strip() for r in x if pd.notna(r) and str(r).strip()])))
+                            ).reset_index()
+                            role_agg.rename(columns={'ROLE': '참여_추출'}, inplace=True)
+                            df_view = df_view.merge(role_agg, on='PDF_FILE_NAME', how='left')
+                            df_view['참여'] = df_view['참여_추출'].fillna("")
+                            df_view = df_view.drop(columns=['참여_추출'])
+                    
+                    # 2) 단독 판단용: 논문 전체 저자 수 카운트 (관리자/일반 공통)
+                    q_cnt = f"SELECT PDF_FILE_NAME, COUNT(DISTINCT AUTHOR) as auth_cnt FROM a_info WHERE PDF_FILE_NAME IN ({placeholders}) GROUP BY PDF_FILE_NAME"
+                    cnt_df = pd.read_sql_query(q_cnt, conn, params=tuple(pdf_list))
+                    df_view = df_view.merge(cnt_df, on='PDF_FILE_NAME', how='left')
+                    df_view['auth_cnt'] = df_view.get('auth_cnt', pd.Series()).fillna(0)
+                    
+                    # 3) '저자구분' 계산 로직
+                    def get_author_category(row):
+                        role = str(row.get('참여', ''))
+                        cnt = row.get('auth_cnt', 0)
+                        if not role: return ""
+                        
+                        has_first = "FIRST_AUTHOR" in role
+                        has_corr = "CORRESPONDING_AUTHOR" in role
+                        has_co = "CO_AUTHOR" in role
+                        
+                        if has_first and has_corr:
+                            return "단독" if cnt <= 1 else "주저자&교신저자"
+                        elif has_first:
+                            return "주저자(제1저자)"
+                        elif has_corr:
+                            return "교신(책임)저자"
+                        elif has_co:
+                            return "공동참여"
+                        return ""
+                        
+                    df_view['저자구분'] = df_view.apply(get_author_category, axis=1)
+                    df_view = df_view.drop(columns=['auth_cnt'])
+                    
+                conn.close()
+            except Exception as e:
+                st.error(f"참여/저자구분 정보 조회 오류: {e}")
+
+            # --- 일반 텍스트 및 다중 선택 배열 필터 적용 ---
+            if f.get("title"):
+                df_view = df_view[df_view['TITLE'].str.contains(f.get("title"), case=False, na=False)]
+            
+            if f.get("year"):
+                # [수정] 세션에 문자열이 남아있을 경우를 대비해 안전하게 리스트로 변환
+                y_list = f["year"] if isinstance(f["year"], list) else [f["year"]]
+                df_view = df_view[df_view['PUBLICATION_YEAR'].astype(str).isin([str(y) for y in y_list])]
+            
+            if f.get("journal"):
+                # [수정] 단일 문자열 캐시 충돌 방지
+                j_list = f["journal"] if isinstance(f["journal"], list) else [f["journal"]]
+                df_view = df_view[df_view['JOURNAL_NAME'].isin(j_list)]
+                
+            if is_admin and f.get("author"):
                 if 'SEARCH_AUTHORS' in df_view.columns:
-                    df_view = df_view[df_view['SEARCH_AUTHORS'].str.contains(f["author"], case=False, na=False)]
+                    df_view = df_view[df_view['SEARCH_AUTHORS'].str.contains(f.get("author"), case=False, na=False)]
                 elif 'AUTHOR_LIST' in df_view.columns:
-                    df_view = df_view[df_view['AUTHOR_LIST'].str.contains(f["author"], case=False, na=False)]
-            if is_admin and f["dept"] != "전체":
+                    df_view = df_view[df_view['AUTHOR_LIST'].str.contains(f.get("author"), case=False, na=False)]
+                    
+            if is_admin and f.get("dept"):
                 try:
+                    # [수정] 부서 필터 안전 변환
+                    d_list = f["dept"] if isinstance(f["dept"], list) else [f["dept"]]
+                    
                     conn = sqlite3.connect(DB_FILE)
                     cur = conn.cursor()
-                    cur.execute("SELECT id FROM user_info WHERE dep = ?", (f["dept"],))
+                    placeholders_dept = ','.join(['?'] * len(d_list))
+                    cur.execute(f"SELECT id FROM user_info WHERE dep IN ({placeholders_dept})", tuple(d_list))
                     dept_user_ids = [row[0] for row in cur.fetchall()]
                     conn.close()
                     if dept_user_ids:
@@ -2985,36 +3604,52 @@ def show_my_papers_page():
                         df_view = pd.DataFrame() 
                 except Exception as e:
                     st.error(f"부서 검색 오류: {e}")
+                    
+            if is_admin and f.get("filename", ""):
+                try:
+                    norm_query = normalize_filename_for_search(f["filename"])
+                    if norm_query:
+                        mask_ori = df_view['ORI_FILE_NAME'].apply(normalize_filename_for_search).str.contains(norm_query, case=False, na=False)
+                        mask_pdf = df_view['PDF_FILE_NAME'].apply(normalize_filename_for_search).str.contains(norm_query, case=False, na=False)
+                        df_view = df_view[mask_ori | mask_pdf]
+                except Exception as e:
+                    pass
+
+            # --- 역할 및 저자구분 필터 적용 (저자명 검색 시에만 동작) ---
+            # --- [수정] 역할 및 저자구분 필터 적용 (일반 사용자도 적용되게 조건 변경) ---
+            # 관리자는 저자명 검색어가 있을 때만 이 필터를 작동시키지만, 일반 사용자는 내 논문이므로 항상 작동시킵니다.
+            if not is_admin or (is_admin and search_author):
+                if f.get("roles"):
+                    r_list = f["roles"] if isinstance(f["roles"], list) else [f["roles"]]
+                    df_view = df_view[df_view['참여'].apply(lambda x: any(r in x for r in r_list))]
+                if f.get("author_categories"):
+                    c_list = f["author_categories"] if isinstance(f["author_categories"], list) else [f["author_categories"]]
+                    df_view = df_view[df_view['저자구분'].isin(c_list)]          
 
         # 결과 리스트 출력
         if df_view.empty:
             st.info("검색 결과가 없습니다.")
-        else:            
-            # ---------------------------------------------------------
-            # [수정] 결과 건수 표시 및 엑셀 저장 버튼 (요구사항 3)
-            # ---------------------------------------------------------
+        else:
             col_count, col_excel = st.columns([0.7, 0.3])
             with col_count:
                 st.success(f"총 {len(df_view)}건의 논문이 있습니다.")
             
             with col_excel:
-                # 파일 이름 생성: 2026-04-14T23-57_paper.csv 형식
                 now_str = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M")
-                file_name = f"{now_str}_paper.csv"
+                file_name = f"{now_str}_paper.xlsx"
                 
-                # CSV 데이터 준비 (c_info의 모든 컬럼 포함을 위해 df_view 원본 사용)
-                # UTF-8-SIG는 엑셀에서 한글 깨짐을 방지합니다.
-                csv_data = df_view.to_csv(index=False).encode('utf-8-sig')
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df_view.to_excel(writer, index=False, sheet_name='논문목록')
+                excel_data = buffer.getvalue()
                 
                 st.download_button(
-                    label="📥 엑셀(CSV) 저장",
-                    data=csv_data,
+                    label="📥 엑셀(XLSX) 저장",
+                    data=excel_data,
                     file_name=file_name,
-                    mime="text/csv",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
-                )            
-        # else:
-        #     st.success(f"총 {len(df_view)}건의 논문이 있습니다.")
+                )
             
             df_view = df_view.reset_index(drop=True)
             df_view['연번'] = df_view.index + 1
@@ -3024,15 +3659,32 @@ def show_my_papers_page():
                 status_kor = {'USER_CLAIMED': '사용자확정', 'ADMIN_CONFIRMED': '관리자확정', 'UNCONFIRMED': '미확정'}
                 df_view['CONFIRM_STATUS'] = df_view['CONFIRM_STATUS'].map(lambda v: status_kor.get(str(v).strip(), '미확정'))
 
-            valid_cols = [c for c in display_cols if c in df_view.columns]
+            # 원본 ROLE 컬럼 숨김
+            valid_cols = [c for c in display_cols if c in df_view.columns and c != 'ROLE']
 
             rename_map = {
                 'TITLE': '논문 제목', 'PUBLICATION_YEAR': '발행년도', 'JOURNAL_NAME': '저널명',
                 'SEARCH_AUTHORS': '저자 목록 (영문/한글)', 'AUTHOR_LIST': '저자 목록',
-                'AUTHOR': '저자', 'ROLE': '역할', 'AFFILIATION': '소속', 'DOI': 'DOI',
+                'AUTHOR': '저자', 'AFFILIATION': '소속', 'DOI': 'DOI',
                 'CONFIRM_STATUS': '확정상태'
             }
+            
             final_view = df_view[['연번'] + valid_cols].rename(columns=rename_map)
+            
+            # [수정] 강제 병합 및 컬럼 순서 지정
+            if '참여' in df_view.columns:
+                final_view['참여'] = df_view['참여']
+            if '저자구분' in df_view.columns:
+                final_view['저자구분'] = df_view['저자구분']
+            
+            ordered_cols = ['연번', '참여', '저자구분']
+            if '논문 제목' in final_view.columns: ordered_cols.append('논문 제목')
+                
+            for c in final_view.columns:
+                if c not in ordered_cols:
+                    ordered_cols.append(c)
+                    
+            final_view = final_view[ordered_cols]
 
             event = st.dataframe(
                 final_view, 
@@ -3435,6 +4087,158 @@ def update_abstracts_batch():
     status_text.text(f"✅ 처리 완료! (성공: {success_count}/{total}건)")
     return total, success_count
 
+# -------------------------------------------------------------------------
+# [수정] IMPACT 일괄 업데이트 헬퍼 함수 (NOT_FOUND 로그 기록 기능 추가)
+# -------------------------------------------------------------------------
+def update_impact_batch(target_year, clear_first=False, progress_bar=None, status_text=None, time_text=None):
+    import time
+    import requests
+    import re
+    import datetime
+    import os
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # 컬럼 존재 여부 재검증 및 확보 (안전장치)
+    cursor.execute("PRAGMA table_info(c_info)")
+    existing_cols = [info[1] for info in cursor.fetchall()]
+    for col in ["is_scie", "is_scopus", "is_kci", "IMPACT"]:
+        if col not in existing_cols:
+            cursor.execute(f"ALTER TABLE c_info ADD COLUMN {col} TEXT")
+    conn.commit()
+
+    # [추가] 로그 폴더 및 파일 경로 설정
+    if not os.path.exists(log_folder):
+        os.makedirs(log_folder)
+    log_file_path = os.path.join(log_folder, f"{target_year}_impact_api_call.log")
+
+    # "삭제후진행" 옵션 체크 시 기존 데이터 및 로그 파일 초기화
+    if clear_first:
+        cursor.execute("""
+            UPDATE c_info 
+            SET is_scie = '', is_scopus = '', is_kci = '', IMPACT = '' 
+            WHERE PUBLICATION_YEAR = ? OR CAST(PUBLICATION_YEAR AS TEXT) = ?
+        """, (target_year, target_year))
+        conn.commit()
+        
+        # 삭제 후 진행 시 기존 로그 파일도 깔끔하게 삭제
+        if os.path.exists(log_file_path):
+            os.remove(log_file_path)
+
+    # 분석 대상 조회 (이미 분석된 행은 건너뛰어 '이어하기'가 가능하도록 is_scie가 빈 값인 것만 추출)
+    cursor.execute("""
+        SELECT PDF_FILE_NAME, JOURNAL_NAME, PUBLICATION_YEAR, issn_print, issn_electronic 
+        FROM c_info 
+        WHERE (PUBLICATION_YEAR = ? OR CAST(PUBLICATION_YEAR AS TEXT) = ?)
+          AND (is_scie IS NULL OR is_scie = '')
+          AND JOURNAL_NAME IS NOT NULL AND JOURNAL_NAME != ''
+    """, (target_year, target_year))
+    rows = cursor.fetchall()
+
+    total = len(rows)
+    if total == 0:
+        conn.close()
+        return 0, 0
+
+    success_count = 0
+    start_time = time.time()
+
+    # IMPACT 서비스 URL 확인
+    active_impact_url = get_active_impact_service_url()
+    if not active_impact_url:
+        conn.close()
+        return -1, 0
+
+    impact_url_endpoint = f"{active_impact_url}/api/match"
+
+    for i, (pdf, journal, year, issn_p, issn_e) in enumerate(rows):
+        is_scie, is_scopus, is_kci = False, False, False
+        max_impact = None
+
+        try:
+            pub_year_match = re.search(r'\d{4}', str(year))
+            pub_year_int = int(pub_year_match.group()) if pub_year_match else int(target_year)
+            
+            impact_params = {'journal_name': journal, 'pub_year': pub_year_int}
+            if issn_p: impact_params['issn'] = issn_p
+            if issn_e: impact_params['eissn'] = issn_e
+            
+            resp = requests.get(impact_url_endpoint, params=impact_params, headers={'accept': 'application/json'}, timeout=15)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                journal_data = data.get("journal_data", [])
+                
+                valid_jd = []
+                for jd in journal_data:
+                    base_year = jd.get("base_year")
+                    # 논문 발행년도보다 과거인 기준년도의 DB는 무시
+                    if base_year and pub_year_int < int(base_year):
+                        continue
+                    valid_jd.append(jd)
+                
+                for jd in valid_jd:
+                    flags = jd.get("flags", {})
+                    if flags.get("is_scie"): is_scie = True
+                    if flags.get("is_scopus"): is_scopus = True
+                    if flags.get("is_kci"): is_kci = True
+                    
+                    if flags.get("is_scie"):
+                        jcr = jd.get("jcr", {})
+                        if jcr:
+                            if_val = jcr.get("if_jcr")
+                            if if_val is not None:
+                                try:
+                                    if_float = float(if_val)
+                                    if max_impact is None or if_float > max_impact:
+                                        max_impact = if_float
+                                except ValueError:
+                                    pass
+            success_count += 1
+        except Exception as e:
+            print(f"Batch IMPACT update error for {pdf}: {e}")
+
+        # 분석 결과 DB 업데이트
+        val_scie = "true" if is_scie else "false"
+        val_scopus = "true" if is_scopus else "false"
+        val_kci = "true" if is_kci else "false"
+        val_impact = str(max_impact) if (is_scie and max_impact is not None) else ""
+
+        # ---------------------------------------------------------------------
+        # [추가] IMPACT API 호출 결과 찾지 못한 건에 대한 로그 작성
+        # ---------------------------------------------------------------------
+        if not is_scie and not is_scopus and not is_kci and not val_impact:
+            with open(log_file_path, "a", encoding="utf-8") as lf:
+                lf.write(f"{pdf} : NOT_FOUND\n")
+        # ---------------------------------------------------------------------
+
+        cursor.execute("""
+            UPDATE c_info 
+            SET is_scie=?, is_scopus=?, is_kci=?, IMPACT=? 
+            WHERE PDF_FILE_NAME=?
+        """, (val_scie, val_scopus, val_kci, val_impact, pdf))
+        
+        # UI 업데이트 (진행률 및 예상 시간 계산)
+        if progress_bar and status_text and time_text:
+            progress = (i + 1) / total
+            progress_bar.progress(progress)
+            status_text.text(f"🔄 처리 중 [{i+1}/{total}] : {pdf}")
+            
+            elapsed = time.time() - start_time
+            avg_time = elapsed / (i + 1)
+            eta = avg_time * (total - (i + 1))
+            eta_str = str(datetime.timedelta(seconds=int(eta)))
+            time_text.text(f"⏱️ 예상 남은 시간: {eta_str}")
+
+        # 10건마다 안전하게 DB Commit 수행
+        if i % 10 == 0:
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+    return total, success_count
+
 def show_settings_page():
     """설정 페이지를 표시합니다."""
     import textwrap  # 들여쓰기 제거를 위해 필요
@@ -3629,6 +4433,62 @@ cursor: default;">
                     with st.expander(f"Resolved 폴더에만 있음 (DB 데이터 누락) - ({len(res['orphan_resolved'])}건)", expanded=True):
                         st.write(res['orphan_resolved'] if res['orphan_resolved'] else "없음")
             # ---------- [여기까지 추가] ----------
+            # ---------- [여기서부터 아래 코드 추가] ----------
+            st.markdown("---")
+            st.markdown("#### 📖 ISSN 정보 일괄 업데이트")
+            st.info("💡 `data/issn_final_result.csv` 파일을 읽어서 전체 DB의 논문 제목(TITLE)과 비교한 후, 일치하는 논문에 ISSN 정보를 일괄 업데이트합니다.")
+
+            if st.button("🔄 ISSN 정보 일괄 업데이트 실행", type="primary"):
+                with st.spinner("CSV 파일을 읽어 DB에 업데이트하는 중입니다..."):
+                    success, msg = update_issn_from_csv()
+                
+                if success:
+                    st.success(f"✅ {msg}")
+                else:
+                    st.error(f"❌ {msg}")
+            # ---------- [여기까지 추가] ----------    
+            # ---------- [여기서부터 아래 코드 추가] ----------
+            st.markdown("---")
+            st.markdown("#### 📈 IMPACT 년도별 업데이트")
+            st.info("💡 API호출을 통해 년도별 DB의 논문 IMPACT 정보를 일괄 업데이트합니다. 중단 후 재실행 시 이어서 진행됩니다.")
+
+            # DB에서 보유 중인 연도만 추출
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                years_df = pd.read_sql_query("SELECT DISTINCT PUBLICATION_YEAR FROM c_info WHERE PUBLICATION_YEAR IS NOT NULL ORDER BY PUBLICATION_YEAR DESC", conn)
+                conn.close()
+                # 정수형/문자열이 섞여있을 수 있으므로 안전하게 변환
+                available_years = [str(int(float(y))) for y in years_df['PUBLICATION_YEAR'].dropna().unique() if str(y).strip() and str(y).replace('.0','').isdigit()]
+            except Exception:
+                available_years = []
+
+            if not available_years:
+                st.warning("등록된 발행년도 데이터가 없습니다.")
+            else:
+                col_y, col_chk = st.columns([0.5, 0.5])
+                with col_y:
+                    target_year = st.selectbox("업데이트할 발행년도 선택", available_years)
+                with col_chk:
+                    st.write("") # 간격 맞추기
+                    clear_first = st.checkbox("삭제 후 진행 (해당년도의 기존 IMPACT 분석 결과를 초기화)")
+
+                if st.button("🚀 IMPACT 년도별 업데이트 실행", type="primary"):
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    time_text = st.empty()
+                    
+                    with st.spinner(f"{target_year}년도 IMPACT 일괄 업데이트 중..."):
+                        total_cnt, success_cnt = update_impact_batch(target_year, clear_first, progress_bar, status_text, time_text)
+                        
+                    if total_cnt == -1:
+                        st.error("🚨 IMPACT 분석 서버에 접속할 수 없습니다.")
+                    elif total_cnt == 0:
+                        st.info(f"{target_year}년도에 업데이트할 데이터가 없습니다. (이미 처리 완료됨)")
+                    else:
+                        status_text.text(f"✅ 처리 완료! (총 {total_cnt}건 중 {success_cnt}건 성공)")
+                        time_text.empty()
+                        st.success(f"🎉 {target_year}년도 IMPACT 일괄 업데이트가 완료되었습니다.")
+            # ---------- [여기까지 추가] ----------        
 
     # [탭 4] 활동 로그 (관리자 전용)
     if st.session_state.username == "AD00000" and len(tabs) > 3:
@@ -4232,7 +5092,7 @@ def show_receipt_processing_page():
             if not active_url:
                 st.error("🚨 **PDF 분석 서버에 접속할 수 없습니다.** (메인 및 백업 서버 모두 응답 없음)")
             else:
-                with st.spinner(f"PDF 분석 중... (연결된 서버: {active_url})"):
+                with st.spinner(f"PDF 분석 중... (연결된 서버: {active_url.split('//')[1].split(':')[0]})"):
                     json_data, error = get_pdf_json(file_path, active_url, REQUEST_TIMEOUT)
 
             # json_data, error = get_pdf_json(file_path, PDF_SERVICE_URL, REQUEST_TIMEOUT)
@@ -4263,7 +5123,9 @@ def show_receipt_processing_page():
                 {"Key": "LLM_JSON_FILE_NAME", "Value": llm_json_name},
             ])
             c_info = pd.concat([c_info, new_rows], ignore_index=True).drop_duplicates(subset=['Key'], keep='last')
-            
+            # --- [추가] 누락 정보(NO_TEXT 등) 로깅 및 ISSN API 연동 수행 ---
+            c_info = process_and_log_missing_and_issn(target_pdf_name, c_info)
+            # -------------------------------------------------------------            
             a_info["ORI_FILE_NAME"] = target_ori_name
             a_info["PDF_FILE_NAME"] = target_pdf_name
             a_info["JSON_FILE_NAME"] = json_filename
@@ -4918,6 +5780,7 @@ def main():
     # [중요] 시스템 테마 로드
     if "current_theme" not in st.session_state:
         st.session_state.current_theme = get_system_theme()
+        # print(f"Starting :  Paper Collector v{version}")
 
     if st.session_state.logged_in: current_layout = "wide"
     elif st.session_state.login_view_mode == "upload": current_layout = "wide"
@@ -4947,5 +5810,5 @@ def main():
         show_login_page()
 
 if __name__ == "__main__":
-    version = "1.0.9"
+    version = "1.0.10"
     main()

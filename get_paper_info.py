@@ -307,9 +307,14 @@ def parsing_json(json_data):
     return A_DATA, cdf
 
 
+# def count_no_text(json_data):
+#     cnt_total = len(json_data)
+#     no_cnt = sum(1 for v in json_data.values() if v == "NO_TEXT")
+#     return cnt_total, no_cnt
 def count_no_text(json_data):
     cnt_total = len(json_data)
-    no_cnt = sum(1 for v in json_data.values() if v == "NO_TEXT")
+    # 값이 문자열(str)이면서 'NO'로 시작하는 경우를 카운트
+    no_cnt = sum(1 for v in json_data.values() if isinstance(v, str) and v.startswith("NO"))
     return cnt_total, no_cnt
 
 # --- [추가] 특정 필드(ABSTRACT)만 추출하는 함수 ---
@@ -356,10 +361,10 @@ def get_paper_df(filename):
 
     # ✅ 모델 선택
     if "gpt" in MODEL_NAME:
-        print("gpt")
+        # print("gpt")
         llm = GPTApi(model_name=MODEL_NAME, api_key=OPENAI_API_KEY)
     else:
-        print("local")
+        # print("local")
         llm = LocalApi(model_name=MODEL_NAME, base_url=LLAMA_URL)
 
     # if DEBUG: print(f"\n[📄] Processing {filename} ...")
@@ -367,9 +372,9 @@ def get_paper_df(filename):
     json_data = process_file(filename, prompts, llm)
     # print("=====json_data:\n", json_data)
     cnt_total, no_cnt = count_no_text(json_data)
-    print(f"전체 항목 수: {cnt_total}, 'NO_TEXT'인 항목 수: {no_cnt}")
+    # print(f"전체 항목 수: {cnt_total}, 'NO'로 시작하는 항목 수: {no_cnt}")
     if no_cnt > 5:
-        return None, None, no_cnt
+        return None, None,None,None, no_cnt, MODEL_NAME
     a_result, c_result = parsing_json(json_data)
     # print(c_result)
     # print(a_result)
